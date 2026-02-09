@@ -1,3 +1,3 @@
-# Placeholder module for future Mesh Data Transfer logic.
+# Placeholder module for future Mesh Data Transfer logic
 
 CLASSES = ()

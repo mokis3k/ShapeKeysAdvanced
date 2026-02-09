@@ -37,9 +37,7 @@ from . import presets
 from . import meshDataTransfer
 
 
-# -----------------------------
-# Operators (init/rescan + search clear)
-# -----------------------------
+# Operators (init/rescan, search clear)
 class SKV_OT_SearchClear(Operator):
     bl_idname = "skv.search_clear"
     bl_label = "Clear Search"
@@ -84,11 +82,9 @@ class SKV_OT_InitRescan(Operator):
         return {"FINISHED"}
 
 
-# -----------------------------
-# Scene Props (UI state)
-# -----------------------------
+# Scene Props
 class SKV_Props(PropertyGroup):
-    # Keep -1 to avoid "active" highlight in the list
+    # Keep -1 to avoid active highlight in the list
     keys_index: IntProperty(name="Keys Index", default=-1, min=-1)
     search: StringProperty(name="Search", default="")
     show_select: BoolProperty(name="Select", default=False, update=show_select_update)
@@ -113,9 +109,7 @@ class SKV_Props(PropertyGroup):
     )
 
 
-# -----------------------------
 # Panel
-# -----------------------------
 class SKV_PT_ShapeKeysPanel(Panel):
     bl_label = "Shape Keys Viewer"
     bl_idname = "SKV_PT_shape_keys_viewer_panel"
@@ -167,7 +161,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
         box_ws = layout.box()
         box_ws.label(text="GROUPS", icon="GROUP")
 
-        # a) Groups
+        # Groups
         box_groups = box_ws.box()
         box_groups.label(text="Groups")
 
@@ -187,7 +181,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
         col.separator()
         col.operator("skv.group_rename", icon="GREASEPENCIL", text="")
 
-        # b) Keys in "Group Name" (collapsible)
+        # Keys in "Group Name" (collapsible)
         box_keys = box_ws.box()
         head = box_keys.row(align=True)
         icon = "TRIA_DOWN" if props.keys_open else "TRIA_RIGHT"
@@ -267,7 +261,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
                     rows=rows,
                 )
 
-        # MESH DATA TRANSFER (collapsible placeholder)
+        # MESH DATA TRANSFER (collapsible)
         boxt = layout.box()
         headt = boxt.row(align=True)
         icont = "TRIA_DOWN" if props.transfer_open else "TRIA_RIGHT"
@@ -278,9 +272,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
             boxt.label(text="None", icon="MOD_DATA_TRANSFER")
 
 
-# -----------------------------
 # Registration
-# -----------------------------
 _LOCAL_CLASSES = (
     SKV_OT_SearchClear,
     SKV_OT_InitRescan,

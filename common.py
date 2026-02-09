@@ -7,9 +7,7 @@ INIT_GROUP_NAME = "Init"
 _PRESET_APPLY_GUARD = False
 
 
-# -----------------------------
 # Utilities
-# -----------------------------
 def get_active_object(context):
     obj = context.active_object
     if not obj:
@@ -81,7 +79,7 @@ def tag_redraw_view3d(context):
 
 
 def parse_tokens(text: str) -> list[str]:
-    # Split by comma/semicolon; trim; drop empties.
+    # Split by comma/semicolon, trim, drop empties
     if not text:
         return []
     parts = re.split(r"[;,]+", text)
@@ -94,7 +92,7 @@ def parse_tokens(text: str) -> list[str]:
 
 
 def clear_selection_ui(context, key_data):
-    # Clear selected keys + disable Select mode (hide checkboxes)
+    # Clear selected keys, disable Select mode
     if key_data and hasattr(key_data, "skv_selected"):
         key_data.skv_selected.clear()
     if hasattr(context, "scene") and hasattr(context.scene, "skv_props"):
@@ -102,7 +100,7 @@ def clear_selection_ui(context, key_data):
 
 
 def show_select_update(self, context):
-    # Clear selection when toggling Select mode (either on or off)
+    # Clear selection when toggling Select mode
     obj = get_active_object(context)
     key_data = get_shape_key_data(obj) if obj else None
     if key_data and hasattr(key_data, "skv_selected"):
@@ -110,9 +108,7 @@ def show_select_update(self, context):
     tag_redraw_view3d(context)
 
 
-# -----------------------------
-# Legacy (old versions) group storage on KeyBlock ID props (read-only fallback)
-# -----------------------------
+# Legacy (old versions) group storage on KeyBlock ID props
 def kb_get_group_legacy(kb) -> str:
     try:
         v = kb.get("skv_group", INIT_GROUP_NAME)
@@ -121,9 +117,7 @@ def kb_get_group_legacy(kb) -> str:
         return INIT_GROUP_NAME
 
 
-# -----------------------------
-# Group mapping on Key datablock: Key.skv_key_groups (name -> group)
-# -----------------------------
+# Group mapping on Key datablock: Key.skv_key_groups
 def kd_get_group(key_data, kb_name: str) -> str:
     if not key_data or not hasattr(key_data, "skv_key_groups"):
         return INIT_GROUP_NAME
@@ -163,9 +157,7 @@ def kd_prune_group_map(key_data, valid_names: set[str]) -> None:
             i += 1
 
 
-# -----------------------------
 # Multi-select storage on Key datablock (name list)
-# -----------------------------
 def kd_selected_set(key_data) -> set[str]:
     if not key_data or not hasattr(key_data, "skv_selected"):
         return set()
@@ -203,9 +195,7 @@ def kd_clear_selected(key_data) -> None:
     key_data.skv_selected.clear()
 
 
-# -----------------------------
 # Counts
-# -----------------------------
 def count_keys_in_group(key_data, group_name: str) -> int:
     if not key_data or not getattr(key_data, "key_blocks", None):
         return 0
@@ -230,9 +220,7 @@ def count_selected_in_group(key_data, group_name: str, search: str) -> int:
     return c
 
 
-# -----------------------------
 # Init / scan sync (Operators only)
-# -----------------------------
 def ensure_init_setup_write(obj):
     key_data = get_shape_key_data(obj)
     if not key_data or not getattr(key_data, "key_blocks", None):
@@ -265,9 +253,7 @@ def ensure_init_setup_write(obj):
             kd_set_group(key_data, kb.name, INIT_GROUP_NAME)
 
 
-# -----------------------------
 # Presets (helpers)
-# -----------------------------
 def _is_basis_name(key_data, name: str) -> bool:
     try:
         if not key_data or not key_data.key_blocks:

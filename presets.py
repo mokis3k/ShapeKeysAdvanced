@@ -24,9 +24,7 @@ from .common import (
 )
 
 
-# -----------------------------
 # Data Model (presets)
-# -----------------------------
 class SKV_PresetItem(PropertyGroup):
     name: StringProperty(name="Shape Key", default="")
     max_value: FloatProperty(name="Max", default=1.0)
@@ -45,9 +43,7 @@ class SKV_Preset(PropertyGroup):
     items_index: IntProperty(name="Items Index", default=-1, min=-1)
 
 
-# -----------------------------
 # UI Lists
-# -----------------------------
 class SKV_UL_Presets(UIList):
     bl_idname = "SKV_UL_presets"
 
@@ -78,7 +74,7 @@ class SKV_UL_PresetKeySliders(UIList):
     bl_idname = "SKV_UL_preset_key_sliders"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        # data is SKV_Preset (PropertyGroup). Its id_data is bpy.types.Key datablock.
+        # data is SKV_Preset (PropertyGroup). Its id_data is bpy.types.Key datablock
         preset = data
         key_data = getattr(preset, "id_data", None)
         if not key_data or not getattr(key_data, "key_blocks", None):
@@ -94,9 +90,7 @@ class SKV_UL_PresetKeySliders(UIList):
         layout.prop(kb, "value", text=item.name, slider=True)
 
 
-# -----------------------------
-# Menus
-# -----------------------------
+# Menu
 class SKV_MT_AddToPreset(Menu):
     bl_label = "Add to preset"
     bl_idname = "SKV_MT_add_to_preset"
@@ -114,9 +108,7 @@ class SKV_MT_AddToPreset(Menu):
             op.preset_index = i
 
 
-# -----------------------------
 # Operators
-# -----------------------------
 class SKV_OT_PresetFocusKey(Operator):
     bl_idname = "skv.preset_focus_key"
     bl_label = "Focus Preset Key"

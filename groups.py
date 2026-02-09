@@ -30,9 +30,7 @@ from .common import (
 )
 
 
-# -----------------------------
-# Data Model (groups + selection + group mapping)
-# -----------------------------
+# Data Model (groups, selection, group mapping)
 class SKV_Group(PropertyGroup):
     name: StringProperty(name="Name", default="Group")
 
@@ -46,9 +44,7 @@ class SKV_KeyGroupEntry(PropertyGroup):
     group: StringProperty(name="Group", default=INIT_GROUP_NAME)
 
 
-# -----------------------------
 # UI Lists
-# -----------------------------
 class SKV_UL_Groups(UIList):
     bl_idname = "SKV_UL_groups"
 
@@ -98,9 +94,7 @@ class SKV_UL_KeyBlocks(UIList):
         row.prop(kb, "value", text=kb.name, slider=True)
 
 
-# -----------------------------
 # Menus
-# -----------------------------
 class SKV_MT_MoveToGroup(Menu):
     bl_label = "Move to group"
     bl_idname = "SKV_MT_move_to_group"
@@ -131,9 +125,7 @@ class SKV_MT_SelectActions(Menu):
         layout.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
 
 
-# -----------------------------
 # Operators
-# -----------------------------
 class SKV_OT_KeyToggleSelect(Operator):
     bl_idname = "skv.key_toggle_select"
     bl_label = "Toggle Shape Key Selection"
@@ -353,7 +345,7 @@ class SKV_OT_ResetGroupValues(Operator):
         return {"FINISHED"}
 
 
-# --- Group operators ---
+# Group operators
 class SKV_OT_GroupAdd(Operator):
     bl_idname = "skv.group_add"
     bl_label = "Add Group"
@@ -573,7 +565,7 @@ class SKV_OT_CreateGroupFromSelected(Operator):
                 moved += 1
 
         if moved == 0:
-            # Rollback group if nothing moved (should not happen)
+            # Rollback group if nothing moved
             for i, gg in enumerate(key_data.skv_groups):
                 if gg.name == new_name:
                     key_data.skv_groups.remove(i)
