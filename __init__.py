@@ -4,7 +4,7 @@ bl_info = {
     "version": (0, 5, 5),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > ShapeKeys",
-    "description": "Shape keys grouping, selection tools, and presets (multi-key control).",
+    "description": "Shape keys grouping, selection tools, presets, and mesh data transfer.",
     "category": "Object",
 }
 
@@ -37,7 +37,9 @@ from . import presets
 from . import meshDataTransfer
 
 
-# Operators (init/rescan, search clear)
+# -----------------------------
+# Operators (init/rescan + search clear)
+# -----------------------------
 class SKV_OT_SearchClear(Operator):
     bl_idname = "skv.search_clear"
     bl_label = "Clear Search"
@@ -82,9 +84,10 @@ class SKV_OT_InitRescan(Operator):
         return {"FINISHED"}
 
 
-# Scene Props
+# -----------------------------
+# Scene Props (UI state)
+# -----------------------------
 class SKV_Props(PropertyGroup):
-    # Keep -1 to avoid active highlight in the list
     keys_index: IntProperty(name="Keys Index", default=-1, min=-1)
     search: StringProperty(name="Search", default="")
     show_select: BoolProperty(name="Select", default=False, update=show_select_update)
@@ -108,8 +111,15 @@ class SKV_Props(PropertyGroup):
         description="Comma/semicolon separated list (e.g. L_, R_ or _L, _R)",
     )
 
+    # Tracks last "Apply" input from Prefix/Suffix selector.
+    # Used to prefill name fields in "Create new group" / "Create new preset" dialogs.
+    last_affix_name: StringProperty(name="Last Affix Name", default="")
+    last_affix_pending: BoolProperty(name="Last Affix Pending", default=False)
 
+
+# -----------------------------
 # Panel
+# -----------------------------
 class SKV_PT_ShapeKeysPanel(Panel):
     bl_label = "Shape Keys Viewer"
     bl_idname = "SKV_PT_shape_keys_viewer_panel"
@@ -123,7 +133,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
         obj = get_active_object(context)
 
-        # CONTEXT (always visible)
+        # CONTEXT
         box_ctx = layout.box()
         row = box_ctx.row(align=True)
         row.label(text="OBJECT", icon="OBJECT_DATA")
@@ -146,7 +156,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
         initialized = is_initialized(key_data)
 
-        # Small Rescan button only after Scan
         if initialized:
             row2.operator("skv.init_rescan", text="", icon="FILE_REFRESH")
 
@@ -157,11 +166,10 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
         current_group = get_selected_group_name(key_data) if initialized else INIT_GROUP_NAME
 
-        # GROUP WORKSPACE (always visible)
+        # GROUP WORKSPACE
         box_ws = layout.box()
         box_ws.label(text="GROUPS", icon="GROUP")
 
-        # Groups
         box_groups = box_ws.box()
         box_groups.label(text="Groups")
 
@@ -181,7 +189,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
         col.separator()
         col.operator("skv.group_rename", icon="GREASEPENCIL", text="")
 
-        # Keys in "Group Name" (collapsible)
         box_keys = box_ws.box()
         head = box_keys.row(align=True)
         icon = "TRIA_DOWN" if props.keys_open else "TRIA_RIGHT"
@@ -222,7 +229,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
                 row.prop(props, "affix_value", text="")
                 row.operator("skv.select_by_affix", text="Apply", icon="FILTER")
 
-        # PRESETS (collapsible)
+        # PRESETS
         boxp = layout.box()
         headp = boxp.row(align=True)
         iconp = "TRIA_DOWN" if props.presets_open else "TRIA_RIGHT"
@@ -261,7 +268,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
                     rows=rows,
                 )
 
-        # MESH DATA TRANSFER (collapsible)
+        # MESH DATA TRANSFER (integrated)
         boxt = layout.box()
         headt = boxt.row(align=True)
         icont = "TRIA_DOWN" if props.transfer_open else "TRIA_RIGHT"
@@ -269,10 +276,12 @@ class SKV_PT_ShapeKeysPanel(Panel):
         headt.label(text="MESH DATA TRANSFER")
 
         if props.transfer_open:
-            boxt.label(text="None", icon="MOD_DATA_TRANSFER")
+            meshDataTransfer.draw_transfer_ui(boxt, context)
 
 
+# -----------------------------
 # Registration
+# -----------------------------
 _LOCAL_CLASSES = (
     SKV_OT_SearchClear,
     SKV_OT_InitRescan,
@@ -298,8 +307,12 @@ def register():
     bpy.types.Key.skv_presets = CollectionProperty(type=presets.SKV_Preset)
     bpy.types.Key.skv_preset_index = IntProperty(name="Preset Index", default=0, min=0)
 
+    bpy.types.Object.skv_mesh_data_transfer = PointerProperty(type=meshDataTransfer.SKV_MeshDataSettings)
+
 
 def unregister():
+    del bpy.types.Object.skv_mesh_data_transfer
+
     del bpy.types.Key.skv_preset_index
     del bpy.types.Key.skv_presets
     del bpy.types.Key.skv_key_groups

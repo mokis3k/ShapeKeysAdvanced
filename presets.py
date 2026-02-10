@@ -24,7 +24,9 @@ from .common import (
 )
 
 
+# -----------------------------
 # Data Model (presets)
+# -----------------------------
 class SKV_PresetItem(PropertyGroup):
     name: StringProperty(name="Shape Key", default="")
     max_value: FloatProperty(name="Max", default=1.0)
@@ -43,7 +45,9 @@ class SKV_Preset(PropertyGroup):
     items_index: IntProperty(name="Items Index", default=-1, min=-1)
 
 
+# -----------------------------
 # UI Lists
+# -----------------------------
 class SKV_UL_Presets(UIList):
     bl_idname = "SKV_UL_presets"
 
@@ -53,7 +57,6 @@ class SKV_UL_Presets(UIList):
         row.prop(preset, "name", text="", emboss=False, icon="PRESET")
         row.prop(preset, "value", text="", slider=True)
 
-        # Capture Max button per preset row
         op = row.operator("skv.preset_capture_max_index", text="", icon="COPYDOWN", emboss=True)
         op.preset_index = index
 
@@ -74,7 +77,6 @@ class SKV_UL_PresetKeySliders(UIList):
     bl_idname = "SKV_UL_preset_key_sliders"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        # data is SKV_Preset (PropertyGroup). Its id_data is bpy.types.Key datablock
         preset = data
         key_data = getattr(preset, "id_data", None)
         if not key_data or not getattr(key_data, "key_blocks", None):
@@ -86,11 +88,12 @@ class SKV_UL_PresetKeySliders(UIList):
             layout.label(text=item.name, icon="ERROR")
             return
 
-        # Slider controls actual Shape Key value
         layout.prop(kb, "value", text=item.name, slider=True)
 
 
-# Menu
+# -----------------------------
+# Menus
+# -----------------------------
 class SKV_MT_AddToPreset(Menu):
     bl_label = "Add to preset"
     bl_idname = "SKV_MT_add_to_preset"
@@ -108,7 +111,9 @@ class SKV_MT_AddToPreset(Menu):
             op.preset_index = i
 
 
+# -----------------------------
 # Operators
+# -----------------------------
 class SKV_OT_PresetFocusKey(Operator):
     bl_idname = "skv.preset_focus_key"
     bl_label = "Focus Preset Key"
@@ -122,7 +127,6 @@ class SKV_OT_PresetFocusKey(Operator):
         if not key_data or not key_data.key_blocks:
             return {"CANCELLED"}
 
-        # Switch group to the one containing this shape key
         from .common import kd_get_group
         grp = kd_get_group(key_data, self.key_name)
         if has_group_storage(key_data):
@@ -131,9 +135,6 @@ class SKV_OT_PresetFocusKey(Operator):
                     key_data.skv_group_index = i
                     break
 
-        # Exact focus without substring search:
-        # 1) Set search empty
-        # 2) Set active index to exact key index
         if hasattr(context.scene, "skv_props"):
             context.scene.skv_props.search = ""
             try:
@@ -154,6 +155,12 @@ class SKV_OT_PresetAddFromSelected(Operator):
     name: StringProperty(name="Preset Name", default="New Preset")
 
     def invoke(self, context, event):
+        props = getattr(context.scene, "skv_props", None)
+        if props and props.last_affix_pending and props.last_affix_name.strip():
+            self.name = props.last_affix_name.strip()
+            props.last_affix_pending = False
+        else:
+            self.name = "New Preset"
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -211,7 +218,7 @@ class SKV_OT_PresetAddFromSelected(Operator):
             return {"CANCELLED"}
 
         key_data.skv_preset_index = len(key_data.skv_presets) - 1
-        preset.value = 1.0  # triggers update -> apply
+        preset.value = 1.0
 
         clear_selection_ui(context, key_data)
         tag_redraw_view3d(context)
@@ -226,6 +233,12 @@ class SKV_OT_PresetAddEmpty(Operator):
     name: StringProperty(name="Preset Name", default="New Preset")
 
     def invoke(self, context, event):
+        props = getattr(context.scene, "skv_props", None)
+        if props and props.last_affix_pending and props.last_affix_name.strip():
+            self.name = props.last_affix_name.strip()
+            props.last_affix_pending = False
+        else:
+            self.name = "New Preset"
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):

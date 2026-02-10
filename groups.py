@@ -30,7 +30,9 @@ from .common import (
 )
 
 
-# Data Model (groups, selection, group mapping)
+# -----------------------------
+# Data Model (groups + selection + group mapping)
+# -----------------------------
 class SKV_Group(PropertyGroup):
     name: StringProperty(name="Name", default="Group")
 
@@ -44,7 +46,9 @@ class SKV_KeyGroupEntry(PropertyGroup):
     group: StringProperty(name="Group", default=INIT_GROUP_NAME)
 
 
+# -----------------------------
 # UI Lists
+# -----------------------------
 class SKV_UL_Groups(UIList):
     bl_idname = "SKV_UL_groups"
 
@@ -94,7 +98,9 @@ class SKV_UL_KeyBlocks(UIList):
         row.prop(kb, "value", text=kb.name, slider=True)
 
 
+# -----------------------------
 # Menus
+# -----------------------------
 class SKV_MT_MoveToGroup(Menu):
     bl_label = "Move to group"
     bl_idname = "SKV_MT_move_to_group"
@@ -125,7 +131,9 @@ class SKV_MT_SelectActions(Menu):
         layout.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
 
 
+# -----------------------------
 # Operators
+# -----------------------------
 class SKV_OT_KeyToggleSelect(Operator):
     bl_idname = "skv.key_toggle_select"
     bl_label = "Toggle Shape Key Selection"
@@ -211,7 +219,8 @@ class SKV_OT_SelectByAffix(Operator):
         props = context.scene.skv_props
         selected_group = get_selected_group_name(key_data)
 
-        tokens = parse_tokens(props.affix_value)
+        raw_affix = props.affix_value
+        tokens = parse_tokens(raw_affix)
         if not tokens:
             self.report({"INFO"}, "No prefix/suffix provided.")
             return {"CANCELLED"}
@@ -240,7 +249,12 @@ class SKV_OT_SelectByAffix(Operator):
             self.report({"INFO"}, "No shape keys matched.")
             return {"CANCELLED"}
 
-        context.scene.skv_props.affix_value = ""
+        # Track the last applied affix and mark it as pending for name prefills.
+        props.last_affix_name = raw_affix.strip()
+        props.last_affix_pending = True
+
+        # Clear input for next usage.
+        props.affix_value = ""
 
         tag_redraw_view3d(context)
         return {"FINISHED"}
@@ -345,7 +359,7 @@ class SKV_OT_ResetGroupValues(Operator):
         return {"FINISHED"}
 
 
-# Group operators
+# --- Group operators ---
 class SKV_OT_GroupAdd(Operator):
     bl_idname = "skv.group_add"
     bl_label = "Add Group"
@@ -513,6 +527,14 @@ class SKV_OT_CreateGroupFromSelected(Operator):
     name: StringProperty(name="Group Name", default="New Group")
 
     def invoke(self, context, event):
+        # Prefill from last applied affix, only if it is pending.
+        props = getattr(context.scene, "skv_props", None)
+        if props and props.last_affix_pending and props.last_affix_name.strip():
+            self.name = props.last_affix_name.strip()
+            # One-shot: clear pending so other creates revert to defaults unless Apply is used again.
+            props.last_affix_pending = False
+        else:
+            self.name = "New Group"
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -565,7 +587,7 @@ class SKV_OT_CreateGroupFromSelected(Operator):
                 moved += 1
 
         if moved == 0:
-            # Rollback group if nothing moved
+            # Rollback group if nothing moved (should not happen)
             for i, gg in enumerate(key_data.skv_groups):
                 if gg.name == new_name:
                     key_data.skv_groups.remove(i)
