@@ -1,3 +1,5 @@
+CLASSES = ()
+
 # # SPDX-License-Identifier: GPL-2.0-or-later
 # # Integrated Mesh Data Transfer module (adapted from single-file version)
 #
