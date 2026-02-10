@@ -4,7 +4,7 @@ bl_info = {
     "version": (0, 5, 5),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > ShapeKeys",
-    "description": "Shape keys grouping, selection tools, presets, and mesh data transfer.",
+    "description": "Shape keys grouping, selection tools, presets, and shape keys transfer.",
     "category": "Object",
 }
 
@@ -22,7 +22,6 @@ from bpy.props import (
 from .common import (
     enum_groups_for_active_object,
     show_select_update,
-    get_active_object,
     get_shape_key_data,
     has_group_storage,
     is_initialized,
@@ -38,7 +37,7 @@ from . import meshDataTransfer
 
 
 # -----------------------------
-# Operators (init/rescan + search clear)
+# Operators (search clear + scan)
 # -----------------------------
 class SKV_OT_SearchClear(Operator):
     bl_idname = "skv.search_clear"
@@ -61,9 +60,9 @@ class SKV_OT_InitRescan(Operator):
     def execute(self, context):
         from .common import ensure_init_setup_write
 
-        obj = get_active_object(context)
-        if not obj:
-            self.report({"WARNING"}, "Active object has no shape keys support.")
+        obj = context.active_object
+        if not obj or obj.type != "MESH":
+            self.report({"WARNING"}, "Active object is not a mesh.")
             return {"CANCELLED"}
 
         key_data = get_shape_key_data(obj)
@@ -92,9 +91,11 @@ class SKV_Props(PropertyGroup):
     search: StringProperty(name="Search", default="")
     show_select: BoolProperty(name="Select", default=False, update=show_select_update)
 
+    groups_open: BoolProperty(name="Groups", default=True)
     keys_open: BoolProperty(name="Keys", default=True)
     presets_open: BoolProperty(name="Presets", default=False)
-    transfer_open: BoolProperty(name="Mesh Data Transfer", default=False)
+    transfer_open: BoolProperty(name="Shape Keys Transfer", default=False)
+
     move_to_group: EnumProperty(name="Move To", items=enum_groups_for_active_object)
 
     affix_type: EnumProperty(
@@ -112,7 +113,6 @@ class SKV_Props(PropertyGroup):
     )
 
     # Tracks last "Apply" input from Prefix/Suffix selector.
-    # Used to prefill name fields in "Create new group" / "Create new preset" dialogs.
     last_affix_name: StringProperty(name="Last Affix Name", default="")
     last_affix_pending: BoolProperty(name="Last Affix Pending", default=False)
 
@@ -131,149 +131,150 @@ class SKV_PT_ShapeKeysPanel(Panel):
         layout = self.layout
         props = context.scene.skv_props
 
-        obj = get_active_object(context)
+        obj = context.active_object
 
         # CONTEXT
         box_ctx = layout.box()
-        row = box_ctx.row(align=True)
-        row.label(text="OBJECT", icon="OBJECT_DATA")
+        box_ctx.label(text="OBJECT", icon="OBJECT_DATA")
 
-        if not obj:
-            box_ctx.label(text="No supported active mesh")
+        if not obj or obj.type != "MESH":
+            box_ctx.label(text="No active mesh object")
             return
 
         row2 = box_ctx.row(align=True)
         row2.label(text=obj.name, icon="MESH_DATA")
 
         key_data = get_shape_key_data(obj)
-        if not key_data or not getattr(key_data, "key_blocks", None):
-            layout.label(text="No Shape Keys for selected object")
-            return
+        can_groups = bool(key_data) and has_group_storage(key_data)
 
-        if not has_group_storage(key_data):
-            layout.label(text="Group storage not available.")
-            return
-
-        initialized = is_initialized(key_data)
+        initialized = is_initialized(key_data) if can_groups else False
 
         if initialized:
             row2.operator("skv.init_rescan", text="", icon="FILE_REFRESH")
 
-        if not initialized:
-            layout.separator()
-            layout.operator("skv.init_rescan", text="Scan", icon="FILE_REFRESH")
-            return
-
         current_group = get_selected_group_name(key_data) if initialized else INIT_GROUP_NAME
 
-        # GROUP WORKSPACE
-        box_ws = layout.box()
-        box_ws.label(text="GROUPS", icon="GROUP")
+        # GROUP WORKSPACE (only if Key datablock exists and supports storage)
+        if can_groups:
+            if not initialized:
+                layout.separator()
+                layout.operator("skv.init_rescan", text="Scan", icon="FILE_REFRESH")
+            else:
+                box_ws = layout.box()
+                box_ws.label(text="GROUP WORKSPACE", icon="GROUP")
 
-        box_groups = box_ws.box()
-        box_groups.label(text="Groups")
+                # Groups (collapsible)
+                box_groups = box_ws.box()
+                headg = box_groups.row(align=True)
+                icong = "TRIA_DOWN" if props.groups_open else "TRIA_RIGHT"
+                headg.prop(props, "groups_open", text="", emboss=False, icon=icong)
+                headg.label(text="Groups")
 
-        rowg = box_groups.row()
-        rowg.template_list(
-            "SKV_UL_groups",
-            "",
-            key_data,
-            "skv_groups",
-            key_data,
-            "skv_group_index",
-            rows=5,
-        )
-        col = rowg.column(align=True)
-        col.operator("skv.group_add", icon="ADD", text="")
-        col.operator("skv.group_remove", icon="REMOVE", text="")
-        col.separator()
-        col.operator("skv.group_rename", icon="GREASEPENCIL", text="")
+                if props.groups_open:
+                    rowg = box_groups.row()
+                    rowg.template_list(
+                        "SKV_UL_groups",
+                        "",
+                        key_data,
+                        "skv_groups",
+                        key_data,
+                        "skv_group_index",
+                        rows=5,
+                    )
+                    col = rowg.column(align=True)
+                    col.operator("skv.group_add", icon="ADD", text="")
+                    col.operator("skv.group_remove", icon="REMOVE", text="")
+                    col.separator()
+                    col.operator("skv.group_rename", icon="GREASEPENCIL", text="")
 
-        box_keys = box_ws.box()
-        head = box_keys.row(align=True)
-        icon = "TRIA_DOWN" if props.keys_open else "TRIA_RIGHT"
-        head.prop(props, "keys_open", text="", emboss=False, icon=icon)
-        head.label(text=f"Keys in '{current_group}'")
+                # Keys in Group (collapsible)
+                box_keys = box_ws.box()
+                head = box_keys.row(align=True)
+                icon = "TRIA_DOWN" if props.keys_open else "TRIA_RIGHT"
+                head.prop(props, "keys_open", text="", emboss=False, icon=icon)
+                head.label(text=f"Keys in '{current_group}'")
 
-        if initialized and props.keys_open:
-            group_count = count_keys_in_group(key_data, current_group)
+                if props.keys_open:
+                    group_count = count_keys_in_group(key_data, current_group)
 
-            if group_count > 0:
-                row = box_keys.row(align=True)
-                row.prop(props, "search", text="", icon="VIEWZOOM")
-                row.operator("skv.search_clear", text="", icon="X")
+                    if group_count > 0:
+                        row = box_keys.row(align=True)
+                        row.prop(props, "search", text="", icon="VIEWZOOM")
+                        row.operator("skv.search_clear", text="", icon="X")
 
-                row = box_keys.row(align=True)
-                row.prop(props, "show_select", text="Select", toggle=True)
-                row.menu("SKV_MT_select_actions", text="", icon="DOWNARROW_HLT")
+                        row = box_keys.row(align=True)
+                        row.prop(props, "show_select", text="Select", toggle=True)
+                        row.menu("SKV_MT_select_actions", text="", icon="DOWNARROW_HLT")
 
-                if props.show_select:
-                    row = box_keys.row(align=True)
-                    row.operator("skv.select_visible", text="All").mode = "ALL"
-                    row.operator("skv.select_visible", text="Clear").mode = "NONE"
-                    row.operator("skv.select_visible", text="Invert").mode = "INVERT"
+                        if props.show_select:
+                            row = box_keys.row(align=True)
+                            row.operator("skv.select_visible", text="All").mode = "ALL"
+                            row.operator("skv.select_visible", text="Clear").mode = "NONE"
+                            row.operator("skv.select_visible", text="Invert").mode = "INVERT"
 
-            box_keys.template_list(
-                "SKV_UL_key_blocks",
-                "",
-                key_data,
-                "key_blocks",
-                props,
-                "keys_index",
-                rows=10,
-            )
+                    box_keys.template_list(
+                        "SKV_UL_key_blocks",
+                        "",
+                        key_data,
+                        "key_blocks",
+                        props,
+                        "keys_index",
+                        rows=10,
+                    )
 
-            if props.show_select and group_count > 0:
-                row = box_keys.row(align=True)
-                row.prop(props, "affix_type", text="")
-                row.prop(props, "affix_value", text="")
-                row.operator("skv.select_by_affix", text="Apply", icon="FILTER")
+                    if props.show_select and group_count > 0:
+                        row = box_keys.row(align=True)
+                        row.prop(props, "affix_type", text="")
+                        row.prop(props, "affix_value", text="")
+                        row.operator("skv.select_by_affix", text="Apply", icon="FILTER")
 
-        # PRESETS
-        boxp = layout.box()
-        headp = boxp.row(align=True)
-        iconp = "TRIA_DOWN" if props.presets_open else "TRIA_RIGHT"
-        headp.prop(props, "presets_open", text="", emboss=False, icon=iconp)
-        headp.label(text="PRESETS")
+                # Presets (collapsible)
+                boxp = layout.box()
+                headp = boxp.row(align=True)
+                iconp = "TRIA_DOWN" if props.presets_open else "TRIA_RIGHT"
+                headp.prop(props, "presets_open", text="", emboss=False, icon=iconp)
+                headp.label(text="PRESETS")
 
-        if initialized and props.presets_open:
-            row = boxp.row()
-            row.template_list(
-                "SKV_UL_presets",
-                "",
-                key_data,
-                "skv_presets",
-                key_data,
-                "skv_preset_index",
-                rows=4,
-            )
-            col = row.column(align=True)
-            col.operator("skv.preset_add_empty", icon="ADD", text="")
-            col.operator("skv.preset_remove", icon="REMOVE", text="")
-            col.separator()
-            col.operator("skv.preset_rename", icon="GREASEPENCIL", text="")
+                if props.presets_open:
+                    row = boxp.row()
+                    row.template_list(
+                        "SKV_UL_presets",
+                        "",
+                        key_data,
+                        "skv_presets",
+                        key_data,
+                        "skv_preset_index",
+                        rows=4,
+                    )
+                    col = row.column(align=True)
+                    col.operator("skv.preset_add_empty", icon="ADD", text="")
+                    col.operator("skv.preset_remove", icon="REMOVE", text="")
+                    col.separator()
+                    col.operator("skv.preset_rename", icon="GREASEPENCIL", text="")
 
-            preset = get_active_preset(key_data)
-            if preset:
-                boxp.separator()
-                boxp.label(text="Preset Keys")
-                rows = min(10, max(3, len(preset.items))) if preset.items else 3
-                boxp.template_list(
-                    "SKV_UL_preset_key_sliders",
-                    "",
-                    preset,
-                    "items",
-                    preset,
-                    "items_index",
-                    rows=rows,
-                )
+                    preset = get_active_preset(key_data)
+                    if preset:
+                        boxp.separator()
+                        boxp.label(text="Preset Keys")
+                        rows = min(10, max(3, len(preset.items))) if preset.items else 3
+                        boxp.template_list(
+                            "SKV_UL_preset_key_sliders",
+                            "",
+                            preset,
+                            "items",
+                            preset,
+                            "items_index",
+                            rows=rows,
+                        )
+        else:
+            layout.box().label(text="Groups/Presets require an object with Shape Keys.", icon="INFO")
 
-        # MESH DATA TRANSFER (integrated)
+        # SHAPE KEYS TRANSFER (available for any mesh, including without shape keys)
         boxt = layout.box()
         headt = boxt.row(align=True)
         icont = "TRIA_DOWN" if props.transfer_open else "TRIA_RIGHT"
         headt.prop(props, "transfer_open", text="", emboss=False, icon=icont)
-        headt.label(text="MESH DATA TRANSFER")
+        headt.label(text="SHAPE KEYS TRANSFER")
 
         if props.transfer_open:
             meshDataTransfer.draw_transfer_ui(boxt, context)
@@ -307,11 +308,13 @@ def register():
     bpy.types.Key.skv_presets = CollectionProperty(type=presets.SKV_Preset)
     bpy.types.Key.skv_preset_index = IntProperty(name="Preset Index", default=0, min=0)
 
-    bpy.types.Object.skv_mesh_data_transfer = PointerProperty(type=meshDataTransfer.SKV_MeshDataSettings)
+    bpy.types.Object.skv_shape_keys_transfer = PointerProperty(
+        type=meshDataTransfer.SKV_ShapeKeysTransferSettings
+    )
 
 
 def unregister():
-    del bpy.types.Object.skv_mesh_data_transfer
+    del bpy.types.Object.skv_shape_keys_transfer
 
     del bpy.types.Key.skv_preset_index
     del bpy.types.Key.skv_presets
