@@ -36,9 +36,6 @@ from . import presets
 from . import meshDataTransfer
 
 
-# -----------------------------
-# Operators (search clear + scan)
-# -----------------------------
 class SKV_OT_SearchClear(Operator):
     bl_idname = "skv.search_clear"
     bl_label = "Clear Search"
@@ -83,9 +80,6 @@ class SKV_OT_InitRescan(Operator):
         return {"FINISHED"}
 
 
-# -----------------------------
-# Scene Props (UI state)
-# -----------------------------
 class SKV_Props(PropertyGroup):
     keys_index: IntProperty(name="Keys Index", default=-1, min=-1)
     search: StringProperty(name="Search", default="")
@@ -112,14 +106,10 @@ class SKV_Props(PropertyGroup):
         description="Comma/semicolon separated list (e.g. L_, R_ or _L, _R)",
     )
 
-    # Tracks last "Apply" input from Prefix/Suffix selector.
     last_affix_name: StringProperty(name="Last Affix Name", default="")
     last_affix_pending: BoolProperty(name="Last Affix Pending", default=False)
 
 
-# -----------------------------
-# Panel
-# -----------------------------
 class SKV_PT_ShapeKeysPanel(Panel):
     bl_label = "Shape Keys Viewer"
     bl_idname = "SKV_PT_shape_keys_viewer_panel"
@@ -133,7 +123,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
         obj = context.active_object
 
-        # CONTEXT
         box_ctx = layout.box()
         box_ctx.label(text="OBJECT", icon="OBJECT_DATA")
 
@@ -146,7 +135,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
         key_data = get_shape_key_data(obj)
         can_groups = bool(key_data) and has_group_storage(key_data)
-
         initialized = is_initialized(key_data) if can_groups else False
 
         if initialized:
@@ -154,7 +142,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
         current_group = get_selected_group_name(key_data) if initialized else INIT_GROUP_NAME
 
-        # GROUP WORKSPACE (only if Key datablock exists and supports storage)
         if can_groups:
             if not initialized:
                 layout.separator()
@@ -163,7 +150,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
                 box_ws = layout.box()
                 box_ws.label(text="GROUP WORKSPACE", icon="GROUP")
 
-                # Groups (collapsible)
                 box_groups = box_ws.box()
                 headg = box_groups.row(align=True)
                 icong = "TRIA_DOWN" if props.groups_open else "TRIA_RIGHT"
@@ -187,7 +173,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
                     col.separator()
                     col.operator("skv.group_rename", icon="GREASEPENCIL", text="")
 
-                # Keys in Group (collapsible)
                 box_keys = box_ws.box()
                 head = box_keys.row(align=True)
                 icon = "TRIA_DOWN" if props.keys_open else "TRIA_RIGHT"
@@ -228,7 +213,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
                         row.prop(props, "affix_value", text="")
                         row.operator("skv.select_by_affix", text="Apply", icon="FILTER")
 
-                # Presets (collapsible)
                 boxp = layout.box()
                 headp = boxp.row(align=True)
                 iconp = "TRIA_DOWN" if props.presets_open else "TRIA_RIGHT"
@@ -269,7 +253,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
         else:
             layout.box().label(text="Groups/Presets require an object with Shape Keys.", icon="INFO")
 
-        # SHAPE KEYS TRANSFER (available for any mesh, including without shape keys)
         boxt = layout.box()
         headt = boxt.row(align=True)
         icont = "TRIA_DOWN" if props.transfer_open else "TRIA_RIGHT"
@@ -280,9 +263,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
             meshDataTransfer.draw_transfer_ui(boxt, context)
 
 
-# -----------------------------
-# Registration
-# -----------------------------
 _LOCAL_CLASSES = (
     SKV_OT_SearchClear,
     SKV_OT_InitRescan,

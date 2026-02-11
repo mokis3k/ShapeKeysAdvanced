@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Shape Keys Transfer (simplified)
+# Shape Keys Transfer (simplified: Closest + Shape Keys)
 
 import bpy
 import bmesh
@@ -11,23 +11,22 @@ from mathutils.bvhtree import BVHTree
 from bpy.types import PropertyGroup, Operator
 from bpy.props import (
     BoolProperty,
-    EnumProperty,
     PointerProperty,
     StringProperty,
 )
 
 
-# -----------------------------------------------------------------------------
-# Poll helpers
-# -----------------------------------------------------------------------------
-
 def _mesh_poll(self, obj):
     return obj is not None and obj.type == "MESH"
 
 
-# -----------------------------------------------------------------------------
-# Core math / geometry
-# -----------------------------------------------------------------------------
+def _clear_status(self, context):
+    try:
+        self.status_message = ""
+        self.status_is_error = False
+    except Exception:
+        pass
+
 
 def _barycentric(points: np.ndarray, tris: np.ndarray) -> np.ndarray:
     """Compute barycentric coordinates of points w.r.t. triangles."""
@@ -70,7 +69,7 @@ def _shape_key_names(source_obj, exclude_muted: bool) -> list[str]:
     return names
 
 
-def _get_sk_coords_world(obj, key_name: str) -> np.ndarray:
+def _get_sk_coords_world(obj, key_name: str) -> np.ndarray | None:
     sk = obj.data.shape_keys
     if not sk:
         return None
@@ -85,8 +84,7 @@ def _get_sk_coords_world(obj, key_name: str) -> np.ndarray:
     mw = np.array(obj.matrix_world, dtype=np.float32)
     co4 = np.ones((v_count, 4), dtype=np.float32)
     co4[:, :3] = co
-    w = np.einsum("ij,aj->ai", mw, co4)[:, :3]
-    return w
+    return np.einsum("ij,aj->ai", mw, co4)[:, :3]
 
 
 def _get_base_coords_world(obj) -> np.ndarray:
@@ -98,16 +96,14 @@ def _get_base_coords_world(obj) -> np.ndarray:
     mw = np.array(obj.matrix_world, dtype=np.float32)
     co4 = np.ones((v_count, 4), dtype=np.float32)
     co4[:, :3] = co
-    w = np.einsum("ij,aj->ai", mw, co4)[:, :3]
-    return w
+    return np.einsum("ij,aj->ai", mw, co4)[:, :3]
 
 
 def _world_to_local(obj, coords_world: np.ndarray) -> np.ndarray:
     imw = np.array(obj.matrix_world.inverted(), dtype=np.float32)
     co4 = np.ones((coords_world.shape[0], 4), dtype=np.float32)
     co4[:, :3] = coords_world
-    loc = np.einsum("ij,aj->ai", imw, co4)[:, :3]
-    return loc
+    return np.einsum("ij,aj->ai", imw, co4)[:, :3]
 
 
 def _ensure_target_shape_key(obj, name: str):
@@ -122,6 +118,7 @@ def _ensure_target_shape_key(obj, name: str):
 def _set_sk_coords_local(obj, name: str, coords_local: np.ndarray):
     kb = _ensure_target_shape_key(obj, name)
     kb.data.foreach_set("co", coords_local.ravel())
+    return kb
 
 
 def _get_vertex_group_mask(obj, group_name: str) -> np.ndarray | None:
@@ -153,10 +150,6 @@ def _snap_to_source_vertices(coords_world: np.ndarray, source_coords_world: np.n
     return out
 
 
-# -----------------------------------------------------------------------------
-# Transfer implementation (Closest)
-# -----------------------------------------------------------------------------
-
 class _ClosestProjector:
     def __init__(self, source_obj):
         self.source_obj = source_obj
@@ -171,7 +164,6 @@ class _ClosestProjector:
 
         self.bm.verts.ensure_lookup_table()
         self.bm.faces.ensure_lookup_table()
-
         bmesh.ops.triangulate(self.bm, faces=self.bm.faces)
 
         mw = source_obj.matrix_world
@@ -180,7 +172,6 @@ class _ClosestProjector:
 
         self.bm.verts.ensure_lookup_table()
         self.bm.faces.ensure_lookup_table()
-
         self.bvh = BVHTree.FromBMesh(self.bm)
 
     def free(self):
@@ -190,17 +181,11 @@ class _ClosestProjector:
             pass
 
     def project(self, target_obj):
-        """
-        For each target vertex (in world), find closest source triangle:
-        returns barycentric coords and triangle vertex indices (source mesh vertex ids).
-        """
         v_count = len(target_obj.data.vertices)
         tgt_world = _get_base_coords_world(target_obj)
 
         bary = np.zeros((v_count, 3), dtype=np.float32)
         tri_ids = np.zeros((v_count, 3), dtype=np.int64)
-        hit = np.zeros((v_count, 1), dtype=np.float32)
-
         missed = np.ones((v_count, 1), dtype=np.float32)
 
         for i in range(v_count):
@@ -219,7 +204,6 @@ class _ClosestProjector:
             bary[i] = b
             tri_ids[i] = np.array([v1.index, v2.index, v3.index], dtype=np.int64)
             missed[i] = 0.0
-            hit[i] = 1.0
 
         return bary, tri_ids, missed
 
@@ -235,107 +219,87 @@ def transfer_shape_keys_closest(
     if not names:
         return False, "Source has no shape keys."
 
-    # Projection cache
+    if len(source_obj.data.vertices) == 0 or len(target_obj.data.vertices) == 0:
+        return False, "Source/Target mesh has no vertices."
+
     proj = _ClosestProjector(source_obj)
     try:
         bary, tri_ids, missed = proj.project(target_obj)
+
+        mask = _get_vertex_group_mask(target_obj, vertex_group.strip())
+        tgt_base_world = _get_base_coords_world(target_obj)
+        src_base_world = _get_base_coords_world(source_obj)
+
+        for sk_name in names:
+            src_sk_world = _get_sk_coords_world(source_obj, sk_name)
+            if src_sk_world is None or len(src_sk_world) != len(source_obj.data.vertices):
+                continue
+
+            idx = tri_ids.ravel()
+            tri_coords = src_sk_world[idx].reshape((len(tri_ids), 3, 3))
+            dst_world = _barycentric_location(tri_coords, bary)
+
+            dst_world = dst_world * (1.0 - missed) + tgt_base_world * missed
+
+            if mask is not None:
+                inv = 1.0 - mask
+                dst_world = dst_world * mask + tgt_base_world * inv
+
+            if snap_to_closest:
+                dst_world = _snap_to_source_vertices(dst_world, src_base_world)
+
+            dst_local = _world_to_local(target_obj, dst_world)
+            dst_kb = _set_sk_coords_local(target_obj, sk_name, dst_local)
+
+            # Copy slider range, value and mute
+            try:
+                src_kb = source_obj.data.shape_keys.key_blocks[sk_name]
+                dst_kb.slider_min = src_kb.slider_min
+                dst_kb.slider_max = src_kb.slider_max
+                dst_kb.value = float(src_kb.value)
+                dst_kb.mute = bool(getattr(src_kb, "mute", False))
+            except Exception:
+                pass
+
+        if not target_obj.data.shape_keys:
+            return False, "Failed to create shape keys on target."
+
+        return True, ""
     finally:
-        # Keep bmesh around only while projecting
-        pass
+        proj.free()
 
-    mask = _get_vertex_group_mask(target_obj, vertex_group)
-    tgt_base_world = _get_base_coords_world(target_obj)
-
-    src_base_world = _get_base_coords_world(source_obj)
-
-    # Pre-build KD for snap (base mesh vertices)
-    if snap_to_closest:
-        # For best results, snap after transferring each key.
-        pass
-
-    # Transfer each shape key
-    for sk_name in names:
-        src_sk_world = _get_sk_coords_world(source_obj, sk_name)
-        if src_sk_world is None or len(src_sk_world) != len(source_obj.data.vertices):
-            continue
-
-        idx = tri_ids.ravel()
-        tri_coords = src_sk_world[idx].reshape((len(tri_ids), 3, 3))
-        dst_world = _barycentric_location(tri_coords, bary)
-
-        # Missed projections -> keep target base coords
-        dst_world = dst_world * (1.0 - missed) + tgt_base_world * missed
-
-        # Mask blend (only where mask>0)
-        if mask is not None:
-            inv = 1.0 - mask
-            dst_world = dst_world * mask + tgt_base_world * inv
-
-        if snap_to_closest:
-            dst_world = _snap_to_source_vertices(dst_world, src_base_world)
-
-        dst_local = _world_to_local(target_obj, dst_world)
-        _set_sk_coords_local(target_obj, sk_name, dst_local)
-
-        # Copy slider range (best-effort)
-        try:
-            src_kb = source_obj.data.shape_keys.key_blocks[sk_name]
-            dst_kb = target_obj.data.shape_keys.key_blocks[sk_name]
-            dst_kb.slider_min = src_kb.slider_min
-            dst_kb.slider_max = src_kb.slider_max
-        except Exception:
-            pass
-
-    # Cleanup
-    proj.free()
-    return True, ""
-
-
-# -----------------------------------------------------------------------------
-# Settings + Operator + UI
-# -----------------------------------------------------------------------------
 
 class SKV_ShapeKeysTransferSettings(PropertyGroup):
-    # Keep property for UI parity, but only one real option is implemented
-    search_method: EnumProperty(
-        items=[
-            ('CLOSEST', 'Closest', "Closest point on source surface", 1),
-        ],
-        name="Search Method",
-        default='CLOSEST',
-    )
-
-    attributes_to_transfer: EnumProperty(
-        items=[
-            ("SHAPE_KEYS", "Shape Keys", "", 1),
-        ],
-        name="Attribute",
-        default="SHAPE_KEYS",
-    )
-
     mesh_source: PointerProperty(
         name="Source",
         type=bpy.types.Object,
         poll=_mesh_poll,
+        update=_clear_status,
     )
 
     vertex_group_filter: StringProperty(
         name="Vertex Group",
         default="",
         description="Optional mask on Target (weights 0..1). Empty = no mask.",
+        update=_clear_status,
     )
 
     exclude_muted_shapekeys: BoolProperty(
         name="Exclude Muted",
         default=False,
         description="Skip muted shape keys on Source.",
+        update=_clear_status,
     )
 
     snap_to_closest_vertex: BoolProperty(
-        name="Snap to Closest Vertex",
+        name="Snap to Closest",
         default=False,
         description="Snap transferred coordinates to nearest Source vertex (world space).",
+        update=_clear_status,
     )
+
+    status_message: StringProperty(name="Status", default="")
+    status_is_error: BoolProperty(name="Is Error", default=False)
 
 
 class SKV_OT_TransferShapeKeys(Operator):
@@ -363,13 +327,26 @@ class SKV_OT_TransferShapeKeys(Operator):
         ok, err = transfer_shape_keys_closest(
             source_obj=source,
             target_obj=target,
-            vertex_group=p.vertex_group_filter.strip(),
+            vertex_group=p.vertex_group_filter,
             exclude_muted=p.exclude_muted_shapekeys,
             snap_to_closest=p.snap_to_closest_vertex,
         )
+
         if not ok:
-            self.report({'ERROR'}, err)
+            p.status_is_error = True
+            p.status_message = err or "Transfer failed."
+            self.report({'ERROR'}, p.status_message)
             return {'CANCELLED'}
+
+        # Auto scan after successful transfer (populate Groups module & show keys)
+        try:
+            bpy.ops.skv.init_rescan()
+        except Exception:
+            pass
+
+        p.status_is_error = False
+        p.status_message = f"Transfer OK: {source.name} -> {target.name}"
+        self.report({'INFO'}, p.status_message)
         return {'FINISHED'}
 
 
@@ -386,14 +363,19 @@ def draw_transfer_ui(layout, context):
 
     col = layout.column(align=True)
     col.prop(p, "mesh_source")
-    col.prop(p, "search_method", text="")
-    col.prop(p, "attributes_to_transfer", text="")
-    col.separator()
     col.prop(p, "vertex_group_filter")
-    col.prop(p, "exclude_muted_shapekeys")
-    col.prop(p, "snap_to_closest_vertex")
+
+    row = col.row(align=True)
+    row.prop(p, "exclude_muted_shapekeys", text="Exclude Muted", toggle=True)
+    row.prop(p, "snap_to_closest_vertex", text="Snap to Closest", toggle=True)
+
     col.separator()
     col.operator("skv.transfer_shape_keys", icon="MOD_DATA_TRANSFER")
+
+    if p.status_message:
+        icon = "ERROR" if p.status_is_error else "CHECKMARK"
+        col.separator()
+        col.label(text=p.status_message, icon=icon)
 
 
 CLASSES = (
