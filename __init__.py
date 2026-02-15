@@ -61,7 +61,9 @@ class SKV_OT_InitRescan(Operator):
     def execute(self, context):
         from .common import ensure_init_setup_write
 
-        obj = get_active_object(context)
+        props = context.scene.skv_props
+
+        obj = getattr(props, "object_pick", None) or get_active_object(context)
         if not obj:
             self.report({"WARNING"}, "Active object has no shape keys support.")
             return {"CANCELLED"}
@@ -84,6 +86,25 @@ class SKV_OT_InitRescan(Operator):
         return {"FINISHED"}
 
 
+
+def _mesh_object_poll(self, obj):
+    return obj is not None and getattr(obj, "type", None) == "MESH"
+
+
+def object_pick_update(self, context):
+    obj = getattr(self, "object_pick", None)
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return
+    try:
+        # Set as active object and select it.
+        for o in context.view_layer.objects:
+            o.select_set(False)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+    except Exception:
+        pass
+    tag_redraw_view3d(context)
+
 # -----------------------------
 # Scene Props (UI state)
 # -----------------------------
@@ -100,6 +121,12 @@ def transfer_open_update(self, context):
 
 class SKV_Props(PropertyGroup):
     keys_index: IntProperty(name="Keys Index", default=-1, min=-1)
+    object_pick: PointerProperty(
+        name="Object",
+        type=bpy.types.Object,
+        poll=_mesh_object_poll,
+        update=object_pick_update,
+    )
     search: StringProperty(name="Search", default="")
     show_select: BoolProperty(name="Select", default=False, update=show_select_update)
     groups_module_open: BoolProperty(name="Groups", default=True)
@@ -145,7 +172,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
         layout = self.layout
         props = context.scene.skv_props
 
-        obj = get_active_object(context)
+        obj = getattr(props, "object_pick", None) or get_active_object(context)
 
         # CONTEXT
         box_ctx = layout.box()
@@ -157,7 +184,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
             return
 
         row2 = box_ctx.row(align=True)
-        row2.label(text=obj.name, icon="MESH_DATA")
+        row2.prop(props, "object_pick", text="")
 
         key_data = get_shape_key_data(obj)
         if not key_data or not getattr(key_data, "key_blocks", None):
@@ -175,7 +202,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
         if not initialized:
             layout.separator()
-            layout.operator("skv.init_rescan", text="Scan")
+            layout.operator("skv.init_rescan", text="Scan", icon="FILE_REFRESH")
             return
 
         current_group = get_selected_group_name(key_data) if initialized else INIT_GROUP_NAME
@@ -185,7 +212,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
         head_ws = box_ws.row(align=True)
         icon_ws = "TRIA_DOWN" if props.groups_module_open else "TRIA_RIGHT"
         head_ws.prop(props, "groups_module_open", text="", emboss=False, icon=icon_ws)
-        head_ws.label(text="SHAPE KEYS", icon="SHAPEKEY_DATA")
+        head_ws.label(text="GROUPS", icon="GROUP")
 
         if props.groups_module_open:
             # Groups list (static open)
@@ -285,15 +312,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
                     rows=rows,
                 )
 
-        # MESH DATA TRANSFER (integrated)
-        boxt = layout.box()
-        headt = boxt.row(align=True)
-        icont = "TRIA_DOWN" if props.transfer_open else "TRIA_RIGHT"
-        headt.prop(props, "transfer_open", text="", emboss=False, icon=icont)
-        headt.label(text="SHAPE KEYS TRANSFER")
-
-        if props.transfer_open:
-            meshDataTransfer.draw_transfer_ui(boxt, context)
 
 
 # -----------------------------

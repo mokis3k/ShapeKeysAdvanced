@@ -5,7 +5,10 @@ from bpy.props import (
     IntProperty,
     StringProperty,
     CollectionProperty,
+    EnumProperty,
 )
+
+from . import meshDataTransfer
 
 from .common import (
     INIT_GROUP_NAME,
@@ -98,93 +101,6 @@ class SKV_UL_KeyBlocks(UIList):
         row.prop(kb, "value", text=kb.name, slider=True)
 
 
-
-
-
-
-        vis_icon = "HIDE_ON" if getattr(kb, "mute", False) else "HIDE_OFF"
-        opv = row.operator("skv.shape_key_toggle_visibility", text="", icon=vis_icon, emboss=False)
-        opv.key_name = kb.name
-
-        opd = row.operator("skv.shape_key_delete", text="", icon="TRASH", emboss=False)
-        opd.key_name = kb.name
-
-class SKV_OT_ShapeKeyToggleVisibility(Operator):
-    bl_idname = "skv.shape_key_toggle_visibility"
-    bl_label = "Toggle Shape Key Visibility"
-    bl_options = {"REGISTER", "UNDO"}
-
-    key_name: StringProperty(name="Shape Key Name", default="")
-
-    @classmethod
-    def poll(cls, context):
-        obj = get_active_object(context)
-        return bool(obj and get_shape_key_data(obj))
-
-    def execute(self, context):
-        obj = get_active_object(context)
-        key_data = get_shape_key_data(obj) if obj else None
-        if not obj or not key_data:
-            return {"CANCELLED"}
-
-        kb = key_data.key_blocks.get(self.key_name)
-        if kb is None:
-            self.report({"WARNING"}, "Shape key not found.")
-            return {"CANCELLED"}
-
-        # KeyBlock.mute is used as "disabled/hidden" state.
-        kb.mute = not bool(getattr(kb, "mute", False))
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
-
-
-class SKV_OT_ShapeKeyDelete(Operator):
-    bl_idname = "skv.shape_key_delete"
-    bl_label = "Delete Shape Key"
-    bl_options = {"REGISTER", "UNDO"}
-
-    key_name: StringProperty(name="Shape Key Name", default="")
-
-    @classmethod
-    def poll(cls, context):
-        obj = get_active_object(context)
-        return bool(obj and get_shape_key_data(obj))
-
-    def execute(self, context):
-        obj = get_active_object(context)
-        key_data = get_shape_key_data(obj) if obj else None
-        if not obj or not key_data:
-            return {"CANCELLED"}
-
-        kb = key_data.key_blocks.get(self.key_name)
-        if kb is None:
-            self.report({"WARNING"}, "Shape key not found.")
-            return {"CANCELLED"}
-
-        if kb.name == "Basis":
-            self.report({"WARNING"}, "Cannot delete Basis shape key.")
-            return {"CANCELLED"}
-
-        try:
-            obj.shape_key_remove(kb)
-        except Exception as ex:
-            self.report({"ERROR"}, f"Failed to delete shape key: {ex}")
-            return {"CANCELLED"}
-
-        # Reconcile addon storage with current key_blocks.
-        ensure_init_setup_write(obj)
-
-        # Keep UI index valid.
-        try:
-            props = context.scene.skv_props
-            if props.keys_index < 0:
-                props.keys_index = 0
-        except Exception:
-            pass
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
-
 # -----------------------------
 # Menus
 # -----------------------------
@@ -216,6 +132,108 @@ class SKV_MT_SelectActions(Menu):
         layout.menu("SKV_MT_add_to_preset", text="Add to preset", icon="PRESET")
         layout.operator("skv.preset_add_from_selected", text="Create new preset", icon="PRESET")
         layout.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
+
+        layout.separator()
+        layout.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
+
+
+class SKV_OT_TransferTo(Operator):
+    bl_idname = "skv.transfer_to"
+    bl_label = "Transfer to"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def _enum_mesh_targets(self, context):
+        # Operator properties do not support data-block PointerProperty.
+        items = [("", "(None)", "")]
+        for ob in bpy.data.objects:
+            if ob.type == "MESH":
+                items.append((ob.name, ob.name, ""))
+        items[1:] = sorted(items[1:], key=lambda it: it[0].lower())
+        return items
+
+    target_name: EnumProperty(
+        name="Target",
+        items=_enum_mesh_targets,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        src = get_active_object(context)
+        kd = get_shape_key_data(src) if src else None
+        if not src or not kd or not getattr(kd, "key_blocks", None):
+            return False
+        selected = kd_selected_set(kd)
+        selected.discard("Basis")
+        return bool(selected)
+
+    def invoke(self, context, event):
+        src = get_active_object(context)
+        # Default to the first mesh different from source.
+        if not self.target_name:
+            for ob in bpy.data.objects:
+                if ob.type == "MESH" and ob != src:
+                    self.target_name = ob.name
+                    break
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        self.layout.prop(self, "target_name")
+
+    def execute(self, context):
+        source = get_active_object(context)
+        if not source:
+            return {"CANCELLED"}
+
+        target = bpy.data.objects.get(self.target_name)
+        if not target or target.type != "MESH":
+            self.report({"WARNING"}, "Select a target mesh object.")
+            return {"CANCELLED"}
+        if target == source:
+            self.report({"WARNING"}, "Target must be different from source.")
+            return {"CANCELLED"}
+
+        src_kd = get_shape_key_data(source)
+        if not src_kd or not getattr(src_kd, "key_blocks", None):
+            self.report({"WARNING"}, "Source has no shape keys.")
+            return {"CANCELLED"}
+
+        selected = kd_selected_set(src_kd)
+        selected.discard("Basis")
+        if not selected:
+            self.report({"WARNING"}, "No selected shape keys.")
+            return {"CANCELLED"}
+
+        transfer = meshDataTransfer.MeshDataTransfer(
+            source=source,
+            target=target,
+            vertex_group=None,
+            exclude_muted_shapekeys=False,
+            restrict_to_selection=False,
+        )
+
+        ok = False
+        try:
+            ok = transfer.transfer_shape_keys(shapekey_names=selected)
+        except Exception as ex:
+            self.report({"ERROR"}, f"Transfer failed: {ex}")
+            ok = False
+        finally:
+            try:
+                transfer.free()
+            except Exception:
+                pass
+
+        if not ok:
+            self.report({"WARNING"}, "Nothing transferred.")
+            return {"CANCELLED"}
+
+        try:
+            ensure_init_setup_write(target)
+        except Exception:
+            pass
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
 
 
 # -----------------------------
@@ -695,6 +713,7 @@ CLASSES = (
     SKV_UL_KeyBlocks,
     SKV_MT_MoveToGroup,
     SKV_MT_SelectActions,
+    SKV_OT_TransferTo,
     SKV_OT_KeyToggleSelect,
     SKV_OT_SelectVisible,
     SKV_OT_SelectByAffix,
@@ -704,6 +723,4 @@ CLASSES = (
     SKV_OT_GroupRemove,
     SKV_OT_GroupRename,
     SKV_OT_CreateGroupFromSelected,
-    SKV_OT_ShapeKeyToggleVisibility,
-    SKV_OT_ShapeKeyDelete,
 )

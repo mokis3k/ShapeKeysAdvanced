@@ -305,7 +305,7 @@ class MeshDataTransfer:
 
     # ---- Shape keys transfer ----
 
-    def transfer_shape_keys(self) -> bool:
+    def transfer_shape_keys(self, shapekey_names=None) -> bool:
         shape_keys = self.source.get_shape_keys_vert_pos(exclude_muted=self.exclude_muted_shapekeys)
         if not shape_keys:
             return False
@@ -341,6 +341,8 @@ class MeshDataTransfer:
                 pre_values[kb.name] = float(kb.value)
 
         for sk_name, sk_points in shape_keys.items():
+            if shapekey_names is not None and sk_name not in shapekey_names:
+                continue
             src_kb = self.source.shape_keys.get(sk_name) if self.source.shape_keys else None
             slider_min = src_kb.slider_min if src_kb else 0.0
             slider_max = src_kb.slider_max if src_kb else 1.0
@@ -393,10 +395,8 @@ class MeshDataTransfer:
 # -----------------------------------------------------------------------------
 
 class SKV_MeshDataSettings(PropertyGroup):
-    # NOTE: UI/flow is Source -> Target.
-    # The active object is treated as the *source*; the user picks the *target*.
-    mesh_target: PointerProperty(
-        name="Target",
+    mesh_source: PointerProperty(
+        name="Source",
         type=bpy.types.Object,
         poll=_mesh_poll,
     )
@@ -431,33 +431,32 @@ class SKV_OT_TransferMeshData(Operator):
         if context.object is None or context.object.mode != "OBJECT":
             return False
         p = getattr(obj, "skv_mesh_data_transfer", None)
-        return p is not None and p.mesh_target is not None
+        return p is not None and p.mesh_source is not None
 
     def execute(self, context):
-        # Source -> Target workflow:
-        #   active object = source
-        #   picked object = target
-        source = context.active_object
-        p = source.skv_mesh_data_transfer
+        active = context.active_object
+        p = active.skv_mesh_data_transfer
 
         def _clear_fields():
             try:
-                p.mesh_target = None
+                p.mesh_source = None
                 p.vertex_group_filter = ""
             except Exception:
                 pass
 
-        target = p.mesh_target
-        if not _is_mesh_object(target):
+        source = p.mesh_source
+        if not _is_mesh_object(source):
             p.transfer_status = "Failed transfer"
             _clear_fields()
-            self.report({'ERROR'}, "Invalid target object (must be Mesh).")
+            self.report({'ERROR'}, "Invalid source object (must be Mesh).")
             return {'CANCELLED'}
 
-        mask_vertex_group = None
+        mask_vertex_group = p.vertex_group_filter.strip() if p.vertex_group_filter else ""
+        mask_vertex_group = mask_vertex_group if mask_vertex_group else None
+
         transfer_data = MeshDataTransfer(
             source=source,
-            target=target,
+            target=active,
             vertex_group=mask_vertex_group,
             exclude_muted_shapekeys=False,
             restrict_to_selection=False,
@@ -495,7 +494,11 @@ def draw_transfer_ui(layout, context):
         return
 
     col = layout.column(align=True)
-    col.prop(p, "mesh_target")
+    col.prop(p, "mesh_source")
+    col.separator()
+
+    # Dropdown-style selection from existing vertex groups (target object).
+    col.prop_search(p, "vertex_group_filter", obj, "vertex_groups", text="Vertex Group")
     col.separator()
 
     status = (getattr(p, "transfer_status", "") or "").strip()
