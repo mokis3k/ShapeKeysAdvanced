@@ -19,6 +19,30 @@ from bpy.props import (
     EnumProperty,
 )
 
+def _poll_mesh_object(self, obj):
+    # Accept only mesh objects.
+    return bool(obj) and getattr(obj, 'type', None) == 'MESH'
+
+def _poll_transfer_target(scene, obj):
+    # Accept only mesh objects and exclude the current source mesh (stored on Scene).
+    if not obj or getattr(obj, 'type', None) != 'MESH':
+        return False
+    src_name = getattr(scene, 'skv_transfer_source_name', '')
+    return (not src_name) or (obj.name != src_name)
+
+
+def _object_pick_update(props, context):
+    # Make the picked mesh the active object.
+    obj = getattr(props, 'object_pick', None)
+    if not obj or getattr(obj, 'type', None) != 'MESH':
+        return
+    context.view_layer.objects.active = obj
+    try:
+        obj.select_set(True)
+    except Exception:
+        pass
+    tag_redraw_view3d(context)
+
 from .common import (
     enum_groups_for_active_object,
     show_select_update,
@@ -36,7 +60,6 @@ from . import groups
 from . import presets
 from . import meshDataTransfer
 
-
 # -----------------------------
 # Operators (init/rescan + search clear)
 # -----------------------------
@@ -52,7 +75,6 @@ class SKV_OT_SearchClear(Operator):
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
-
 class SKV_OT_InitRescan(Operator):
     bl_idname = "skv.init_rescan"
     bl_label = "Scan/Rescan"
@@ -63,7 +85,15 @@ class SKV_OT_InitRescan(Operator):
 
         props = context.scene.skv_props
 
-        obj = getattr(props, "object_pick", None) or get_active_object(context)
+        # Use the user-selected mesh (if any) as the active context object.
+        picked_obj = getattr(props, "object_pick", None)
+        if picked_obj and getattr(picked_obj, "type", None) == "MESH":
+            obj = picked_obj
+        else:
+            obj = get_active_object(context)
+            if obj and getattr(obj, "type", None) == "MESH":
+                props.object_pick = obj
+
         if not obj:
             self.report({"WARNING"}, "Active object has no shape keys support.")
             return {"CANCELLED"}
@@ -85,26 +115,6 @@ class SKV_OT_InitRescan(Operator):
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
-
-
-def _mesh_object_poll(self, obj):
-    return obj is not None and getattr(obj, "type", None) == "MESH"
-
-
-def object_pick_update(self, context):
-    obj = getattr(self, "object_pick", None)
-    if obj is None or getattr(obj, "type", None) != "MESH":
-        return
-    try:
-        # Set as active object and select it.
-        for o in context.view_layer.objects:
-            o.select_set(False)
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-    except Exception:
-        pass
-    tag_redraw_view3d(context)
-
 # -----------------------------
 # Scene Props (UI state)
 # -----------------------------
@@ -121,15 +131,15 @@ def transfer_open_update(self, context):
 
 class SKV_Props(PropertyGroup):
     keys_index: IntProperty(name="Keys Index", default=-1, min=-1)
-    object_pick: PointerProperty(
-        name="Object",
-        type=bpy.types.Object,
-        poll=_mesh_object_poll,
-        update=object_pick_update,
-    )
     search: StringProperty(name="Search", default="")
     show_select: BoolProperty(name="Select", default=False, update=show_select_update)
     groups_module_open: BoolProperty(name="Groups", default=True)
+    object_pick: PointerProperty(
+        name='Object',
+        type=bpy.types.Object,
+        poll=_poll_mesh_object,
+        update=_object_pick_update,
+    )
 
 
     groups_open: BoolProperty(name="Groups", default=True)
@@ -157,7 +167,6 @@ class SKV_Props(PropertyGroup):
     last_affix_name: StringProperty(name="Last Affix Name", default="")
     last_affix_pending: BoolProperty(name="Last Affix Pending", default=False)
 
-
 # -----------------------------
 # Panel
 # -----------------------------
@@ -172,7 +181,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
         layout = self.layout
         props = context.scene.skv_props
 
-        obj = getattr(props, "object_pick", None) or get_active_object(context)
+        obj = get_active_object(context)
 
         # CONTEXT
         box_ctx = layout.box()
@@ -184,7 +193,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
             return
 
         row2 = box_ctx.row(align=True)
-        row2.prop(props, "object_pick", text="")
+        row2.prop(props, "object_pick", text="", icon="MESH_DATA")
 
         key_data = get_shape_key_data(obj)
         if not key_data or not getattr(key_data, "key_blocks", None):
@@ -202,7 +211,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
         if not initialized:
             layout.separator()
-            layout.operator("skv.init_rescan", text="Scan", icon="FILE_REFRESH")
+            layout.operator("skv.init_rescan", text="Scan")
             return
 
         current_group = get_selected_group_name(key_data) if initialized else INIT_GROUP_NAME
@@ -212,7 +221,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
         head_ws = box_ws.row(align=True)
         icon_ws = "TRIA_DOWN" if props.groups_module_open else "TRIA_RIGHT"
         head_ws.prop(props, "groups_module_open", text="", emboss=False, icon=icon_ws)
-        head_ws.label(text="GROUPS", icon="GROUP")
+        head_ws.label(text="SHAPE KEYS")
 
         if props.groups_module_open:
             # Groups list (static open)
@@ -312,8 +321,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
                     rows=rows,
                 )
 
-
-
 # -----------------------------
 # Registration
 # -----------------------------
@@ -326,12 +333,14 @@ _LOCAL_CLASSES = (
 
 _ALL_CLASSES = _LOCAL_CLASSES + groups.CLASSES + presets.CLASSES + meshDataTransfer.CLASSES
 
-
 def register():
     for cls in _ALL_CLASSES:
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.skv_props = PointerProperty(type=SKV_Props)
+    # Transfer-to dialog storage (Scene-level datablock properties support eyedropper).
+    bpy.types.Scene.skv_transfer_source_name = StringProperty(options={'SKIP_SAVE'})
+    bpy.types.Scene.skv_transfer_target = PointerProperty(type=bpy.types.Object, poll=_poll_transfer_target)
 
     bpy.types.Key.skv_groups = CollectionProperty(type=groups.SKV_Group)
     bpy.types.Key.skv_group_index = IntProperty(name="Group Index", default=0, min=0)
@@ -344,7 +353,6 @@ def register():
 
     bpy.types.Object.skv_mesh_data_transfer = PointerProperty(type=meshDataTransfer.SKV_MeshDataSettings)
 
-
 def unregister():
     del bpy.types.Object.skv_mesh_data_transfer
 
@@ -354,11 +362,14 @@ def unregister():
     del bpy.types.Key.skv_selected
     del bpy.types.Key.skv_groups
     del bpy.types.Key.skv_group_index
+    if hasattr(bpy.types.Scene, 'skv_transfer_target'):
+        del bpy.types.Scene.skv_transfer_target
+    if hasattr(bpy.types.Scene, 'skv_transfer_source_name'):
+        del bpy.types.Scene.skv_transfer_source_name
     del bpy.types.Scene.skv_props
 
     for cls in reversed(_ALL_CLASSES):
         bpy.utils.unregister_class(cls)
-
 
 if __name__ == "__main__":
     register()

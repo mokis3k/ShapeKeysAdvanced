@@ -343,6 +343,7 @@ class MeshDataTransfer:
         for sk_name, sk_points in shape_keys.items():
             if shapekey_names is not None and sk_name not in shapekey_names:
                 continue
+
             src_kb = self.source.shape_keys.get(sk_name) if self.source.shape_keys else None
             slider_min = src_kb.slider_min if src_kb else 0.0
             slider_max = src_kb.slider_max if src_kb else 1.0
