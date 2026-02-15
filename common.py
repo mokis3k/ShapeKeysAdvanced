@@ -1,7 +1,7 @@
 import re
 import bpy
 
-INIT_GROUP_NAME = "Init"
+INIT_GROUP_NAME = "Main"
 
 # Prevent recursion when preset slider writes to key values
 _PRESET_APPLY_GUARD = False
@@ -42,11 +42,93 @@ def group_names(key_data):
 
 
 def is_initialized(key_data) -> bool:
+    """Return True when addon storage exists and default group is present.
+
+    Minimal safety policy:
+    - Only INIT_GROUP_NAME is considered a valid default group.
+    - Legacy group name "Init" is not treated as initialized; it is cleaned up on Scan.
+    """
     if not has_group_storage(key_data):
         return False
-    if not key_data.skv_groups:
+    if not getattr(key_data, "skv_groups", None):
         return False
     return any(g.name == INIT_GROUP_NAME for g in key_data.skv_groups)
+
+
+
+def cleanup_legacy_init_group(key_data) -> None:
+    """Minimal in-memory cleanup for legacy default group name "Init".
+
+    This addon instance uses only INIT_GROUP_NAME. If a legacy "Init" group is present
+    (e.g. after hot-reloading the addon without restarting Blender), we normalize it:
+
+    - If INIT_GROUP_NAME exists: remove all "Init" groups and remap any references.
+    - Else: rename the first "Init" to INIT_GROUP_NAME and remove duplicates.
+    - Remove legacy per-key ID prop "skv_group" (no longer used).
+
+    This function is intentionally NOT called during UI drawing to keep behavior simple.
+    It is called from ensure_init_setup_write() (Scan).
+    """
+    if not has_group_storage(key_data) or not getattr(key_data, "skv_groups", None):
+        return
+    # Do not modify linked data.
+    if getattr(key_data, "library", None) is not None:
+        return
+
+    init_indices = [i for i, g in enumerate(key_data.skv_groups) if g.name == "Init"]
+    if not init_indices:
+        # Still remove legacy per-key ID props, if any.
+        if getattr(key_data, "key_blocks", None):
+            for kb in key_data.key_blocks:
+                try:
+                    if "skv_group" in kb:
+                        del kb["skv_group"]
+                except Exception:
+                    pass
+        return
+
+    main_indices = [i for i, g in enumerate(key_data.skv_groups) if g.name == INIT_GROUP_NAME]
+
+    # Remap mapping entries first.
+    if hasattr(key_data, "skv_key_groups"):
+        for it in key_data.skv_key_groups:
+            if getattr(it, "group", "") == "Init":
+                it.group = INIT_GROUP_NAME
+
+    if main_indices:
+        # Default group already exists; drop all legacy groups.
+        for i in reversed(init_indices):
+            try:
+                key_data.skv_groups.remove(i)
+            except Exception:
+                pass
+    else:
+        # Rename the first legacy group to INIT_GROUP_NAME and remove duplicates.
+        try:
+            key_data.skv_groups[init_indices[0]].name = INIT_GROUP_NAME
+        except Exception:
+            pass
+        for i in reversed(init_indices[1:]):
+            try:
+                key_data.skv_groups.remove(i)
+            except Exception:
+                pass
+
+    # Ensure active index is valid after removals/rename.
+    try:
+        if key_data.skv_group_index < 0 or key_data.skv_group_index >= len(key_data.skv_groups):
+            key_data.skv_group_index = 0
+    except Exception:
+        pass
+
+    # Remove legacy per-key ID prop (no longer used).
+    if getattr(key_data, "key_blocks", None):
+        for kb in key_data.key_blocks:
+            try:
+                if "skv_group" in kb:
+                    del kb["skv_group"]
+            except Exception:
+                pass
 
 
 def get_selected_group_name(key_data):
@@ -54,7 +136,8 @@ def get_selected_group_name(key_data):
         return INIT_GROUP_NAME
     idx = int(getattr(key_data, "skv_group_index", 0))
     if 0 <= idx < len(key_data.skv_groups):
-        return key_data.skv_groups[idx].name
+        name = key_data.skv_groups[idx].name
+        return name if name else INIT_GROUP_NAME
     return INIT_GROUP_NAME
 
 
@@ -63,10 +146,7 @@ def enum_groups_for_active_object(self, context):
     key_data = get_shape_key_data(obj) if obj else None
     if not key_data or not has_group_storage(key_data) or not key_data.skv_groups:
         return [(INIT_GROUP_NAME, INIT_GROUP_NAME, "Not initialized")]
-    items = [(g.name, g.name, "") for g in key_data.skv_groups]
-    if not any(i[0] == INIT_GROUP_NAME for i in items):
-        items.insert(0, (INIT_GROUP_NAME, INIT_GROUP_NAME, ""))
-    return items
+    return [(g.name, g.name, "") for g in key_data.skv_groups]
 
 
 def tag_redraw_view3d(context):
@@ -109,15 +189,6 @@ def show_select_update(self, context):
 
 
 # Legacy (old versions) group storage on KeyBlock ID props
-def kb_get_group_legacy(kb) -> str:
-    try:
-        v = kb.get("skv_group", INIT_GROUP_NAME)
-        return v if v else INIT_GROUP_NAME
-    except Exception:
-        return INIT_GROUP_NAME
-
-
-# Group mapping on Key datablock: Key.skv_key_groups
 def kd_get_group(key_data, kb_name: str) -> str:
     if not key_data or not hasattr(key_data, "skv_key_groups"):
         return INIT_GROUP_NAME
@@ -230,30 +301,41 @@ def ensure_init_setup_write(obj):
     if getattr(key_data, "library", None) is not None:
         return
 
+    # Minimal safety: normalize any in-memory legacy "Init" group to INIT_GROUP_NAME.
+    cleanup_legacy_init_group(key_data)
+
     names = group_names(key_data)
     if INIT_GROUP_NAME not in names:
         g = key_data.skv_groups.add()
         g.name = INIT_GROUP_NAME
         names = group_names(key_data)
 
-    if key_data.skv_group_index < 0 or key_data.skv_group_index >= len(key_data.skv_groups):
-        key_data.skv_group_index = 0
+    # Keep active index valid.
+    try:
+        if key_data.skv_group_index < 0 or key_data.skv_group_index >= len(key_data.skv_groups):
+            key_data.skv_group_index = 0
+    except Exception:
+        pass
 
+    # Prune mapping entries that point to missing KeyBlocks.
     valid_kb_names = {kb.name for kb in key_data.key_blocks}
     kd_prune_group_map(key_data, valid_kb_names)
 
+    # Ensure every key belongs to an existing group; default to INIT_GROUP_NAME.
     for kb in key_data.key_blocks:
         cur = kd_get_group(key_data, kb.name)
-        if cur == INIT_GROUP_NAME:
-            legacy = kb_get_group_legacy(kb)
-            if legacy in names and legacy != INIT_GROUP_NAME:
-                kd_set_group(key_data, kb.name, legacy)
-                continue
         if cur not in names:
             kd_set_group(key_data, kb.name, INIT_GROUP_NAME)
 
+    # Legacy per-key ID prop is no longer used; remove if present.
+    for kb in key_data.key_blocks:
+        try:
+            if "skv_group" in kb:
+                del kb["skv_group"]
+        except Exception:
+            pass
 
-# Presets (helpers)
+
 def _is_basis_name(key_data, name: str) -> bool:
     try:
         if not key_data or not key_data.key_blocks:

@@ -98,6 +98,93 @@ class SKV_UL_KeyBlocks(UIList):
         row.prop(kb, "value", text=kb.name, slider=True)
 
 
+
+
+
+
+        vis_icon = "HIDE_ON" if getattr(kb, "mute", False) else "HIDE_OFF"
+        opv = row.operator("skv.shape_key_toggle_visibility", text="", icon=vis_icon, emboss=False)
+        opv.key_name = kb.name
+
+        opd = row.operator("skv.shape_key_delete", text="", icon="TRASH", emboss=False)
+        opd.key_name = kb.name
+
+class SKV_OT_ShapeKeyToggleVisibility(Operator):
+    bl_idname = "skv.shape_key_toggle_visibility"
+    bl_label = "Toggle Shape Key Visibility"
+    bl_options = {"REGISTER", "UNDO"}
+
+    key_name: StringProperty(name="Shape Key Name", default="")
+
+    @classmethod
+    def poll(cls, context):
+        obj = get_active_object(context)
+        return bool(obj and get_shape_key_data(obj))
+
+    def execute(self, context):
+        obj = get_active_object(context)
+        key_data = get_shape_key_data(obj) if obj else None
+        if not obj or not key_data:
+            return {"CANCELLED"}
+
+        kb = key_data.key_blocks.get(self.key_name)
+        if kb is None:
+            self.report({"WARNING"}, "Shape key not found.")
+            return {"CANCELLED"}
+
+        # KeyBlock.mute is used as "disabled/hidden" state.
+        kb.mute = not bool(getattr(kb, "mute", False))
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+
+class SKV_OT_ShapeKeyDelete(Operator):
+    bl_idname = "skv.shape_key_delete"
+    bl_label = "Delete Shape Key"
+    bl_options = {"REGISTER", "UNDO"}
+
+    key_name: StringProperty(name="Shape Key Name", default="")
+
+    @classmethod
+    def poll(cls, context):
+        obj = get_active_object(context)
+        return bool(obj and get_shape_key_data(obj))
+
+    def execute(self, context):
+        obj = get_active_object(context)
+        key_data = get_shape_key_data(obj) if obj else None
+        if not obj or not key_data:
+            return {"CANCELLED"}
+
+        kb = key_data.key_blocks.get(self.key_name)
+        if kb is None:
+            self.report({"WARNING"}, "Shape key not found.")
+            return {"CANCELLED"}
+
+        if kb.name == "Basis":
+            self.report({"WARNING"}, "Cannot delete Basis shape key.")
+            return {"CANCELLED"}
+
+        try:
+            obj.shape_key_remove(kb)
+        except Exception as ex:
+            self.report({"ERROR"}, f"Failed to delete shape key: {ex}")
+            return {"CANCELLED"}
+
+        # Reconcile addon storage with current key_blocks.
+        ensure_init_setup_write(obj)
+
+        # Keep UI index valid.
+        try:
+            props = context.scene.skv_props
+            if props.keys_index < 0:
+                props.keys_index = 0
+        except Exception:
+            pass
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
 # -----------------------------
 # Menus
 # -----------------------------
@@ -437,7 +524,7 @@ class SKV_OT_GroupRemove(Operator):
 
         name = key_data.skv_groups[idx].name
         if name == INIT_GROUP_NAME:
-            self.report({"WARNING"}, "Cannot remove 'Init' group.")
+            self.report({"WARNING"}, "Cannot remove 'Main' group.")
             return {"CANCELLED"}
 
         for kb in key_data.key_blocks:
@@ -496,7 +583,7 @@ class SKV_OT_GroupRename(Operator):
 
         old = key_data.skv_groups[idx].name
         if old == INIT_GROUP_NAME:
-            self.report({"WARNING"}, "Cannot rename 'Init' group.")
+            self.report({"WARNING"}, "Cannot rename 'Main' group.")
             return {"CANCELLED"}
 
         new = self.new_name.strip()
@@ -617,4 +704,6 @@ CLASSES = (
     SKV_OT_GroupRemove,
     SKV_OT_GroupRename,
     SKV_OT_CreateGroupFromSelected,
+    SKV_OT_ShapeKeyToggleVisibility,
+    SKV_OT_ShapeKeyDelete,
 )

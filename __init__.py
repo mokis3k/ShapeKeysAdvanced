@@ -87,14 +87,28 @@ class SKV_OT_InitRescan(Operator):
 # -----------------------------
 # Scene Props (UI state)
 # -----------------------------
+
+def transfer_open_update(self, context):
+    # Clear last transfer status when the module is collapsed.
+    if not getattr(self, "transfer_open", False):
+        obj = getattr(context, "active_object", None)
+        if obj and hasattr(obj, "skv_mesh_data_transfer"):
+            try:
+                obj.skv_mesh_data_transfer.transfer_status = ""
+            except Exception:
+                pass
+
 class SKV_Props(PropertyGroup):
     keys_index: IntProperty(name="Keys Index", default=-1, min=-1)
     search: StringProperty(name="Search", default="")
     show_select: BoolProperty(name="Select", default=False, update=show_select_update)
+    groups_module_open: BoolProperty(name="Groups", default=True)
 
+
+    groups_open: BoolProperty(name="Groups", default=True)
     keys_open: BoolProperty(name="Keys", default=True)
     presets_open: BoolProperty(name="Presets", default=False)
-    transfer_open: BoolProperty(name="Mesh Data Transfer", default=False)
+    transfer_open: BoolProperty(name="Shape Keys Transfer", default=False, update=transfer_open_update)
     move_to_group: EnumProperty(name="Move To", items=enum_groups_for_active_object)
 
     affix_type: EnumProperty(
@@ -161,41 +175,43 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
         if not initialized:
             layout.separator()
-            layout.operator("skv.init_rescan", text="Scan", icon="FILE_REFRESH")
+            layout.operator("skv.init_rescan", text="Scan")
             return
 
         current_group = get_selected_group_name(key_data) if initialized else INIT_GROUP_NAME
 
         # GROUP WORKSPACE
         box_ws = layout.box()
-        box_ws.label(text="GROUPS", icon="GROUP")
+        head_ws = box_ws.row(align=True)
+        icon_ws = "TRIA_DOWN" if props.groups_module_open else "TRIA_RIGHT"
+        head_ws.prop(props, "groups_module_open", text="", emboss=False, icon=icon_ws)
+        head_ws.label(text="SHAPE KEYS", icon="SHAPEKEY_DATA")
 
-        box_groups = box_ws.box()
-        box_groups.label(text="Groups")
+        if props.groups_module_open:
+            # Groups list (static open)
+            box_groups = box_ws.box()
+            box_groups.label(text="Groups")
 
-        rowg = box_groups.row()
-        rowg.template_list(
-            "SKV_UL_groups",
-            "",
-            key_data,
-            "skv_groups",
-            key_data,
-            "skv_group_index",
-            rows=5,
-        )
-        col = rowg.column(align=True)
-        col.operator("skv.group_add", icon="ADD", text="")
-        col.operator("skv.group_remove", icon="REMOVE", text="")
-        col.separator()
-        col.operator("skv.group_rename", icon="GREASEPENCIL", text="")
+            rowg = box_groups.row()
+            rowg.template_list(
+                "SKV_UL_groups",
+                "",
+                key_data,
+                "skv_groups",
+                key_data,
+                "skv_group_index",
+                rows=5,
+            )
+            col = rowg.column(align=True)
+            col.operator("skv.group_add", icon="ADD", text="")
+            col.operator("skv.group_remove", icon="REMOVE", text="")
+            col.separator()
+            col.operator("skv.group_rename", icon="GREASEPENCIL", text="")
 
-        box_keys = box_ws.box()
-        head = box_keys.row(align=True)
-        icon = "TRIA_DOWN" if props.keys_open else "TRIA_RIGHT"
-        head.prop(props, "keys_open", text="", emboss=False, icon=icon)
-        head.label(text=f"Keys in '{current_group}'")
+            # Keys list (static open)
+            box_keys = box_ws.box()
+            box_keys.label(text=f"Keys in '{current_group}'")
 
-        if initialized and props.keys_open:
             group_count = count_keys_in_group(key_data, current_group)
 
             if group_count > 0:
@@ -205,7 +221,8 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
                 row = box_keys.row(align=True)
                 row.prop(props, "show_select", text="Select", toggle=True)
-                row.menu("SKV_MT_select_actions", text="", icon="DOWNARROW_HLT")
+                if props.show_select:
+                    row.menu("SKV_MT_select_actions", text="", icon="TRIA_RIGHT")
 
                 if props.show_select:
                     row = box_keys.row(align=True)
@@ -273,7 +290,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
         headt = boxt.row(align=True)
         icont = "TRIA_DOWN" if props.transfer_open else "TRIA_RIGHT"
         headt.prop(props, "transfer_open", text="", emboss=False, icon=icont)
-        headt.label(text="MESH DATA TRANSFER")
+        headt.label(text="SHAPE KEYS TRANSFER")
 
         if props.transfer_open:
             meshDataTransfer.draw_transfer_ui(boxt, context)
