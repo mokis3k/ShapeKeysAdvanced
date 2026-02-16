@@ -127,10 +127,8 @@ class SKV_UL_key_blocks(UIList):
         opd.key_name = kb.name
 
 
-
 # -----------------------------
 # Menus
-
 # -----------------------------
 class SKV_MT_MoveToGroup(Menu):
     bl_label = "Move to group"
@@ -155,13 +153,26 @@ class SKV_MT_SelectActions(Menu):
 
     def draw(self, context):
         layout = self.layout
+
+        # Section: grouping
         layout.menu("SKV_MT_move_to_group", text="Move to group", icon="FILE_FOLDER")
         layout.operator("skv.create_group_from_selected", text="Create new group", icon="NEWFOLDER")
+
+        layout.separator()
+
+        # Section: presets
         layout.menu("SKV_MT_add_to_preset", text="Add to preset", icon="PRESET")
         layout.operator("skv.preset_add_from_selected", text="Create new preset", icon="PRESET")
-        layout.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
-        layout.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
 
+        layout.separator()
+
+        # Section: transfer
+        layout.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
+
+        layout.separator()
+
+        # Section: values
+        layout.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
 
 
 class SKV_OT_ShapeKeyToggleVisibility(Operator):
@@ -233,6 +244,7 @@ class SKV_OT_ShapeKeyDelete(Operator):
 
         tag_redraw_view3d(context)
         return {"FINISHED"}
+
 
 # -----------------------------
 # Operators
@@ -703,8 +715,6 @@ class SKV_OT_CreateGroupFromSelected(Operator):
         return {"FINISHED"}
 
 
-
-
 class SKV_OT_TransferTo(Operator):
     bl_idname = "skv.transfer_to"
     bl_label = "Transfer to"
@@ -796,5 +806,4 @@ CLASSES = (
     SKV_OT_ShapeKeyToggleVisibility,
     SKV_OT_ShapeKeyDelete,
     SKV_OT_TransferTo,
-
 )

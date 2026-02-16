@@ -19,34 +19,9 @@ from bpy.props import (
     EnumProperty,
 )
 
-def _poll_mesh_object(self, obj):
-    # Accept only mesh objects.
-    return bool(obj) and getattr(obj, 'type', None) == 'MESH'
-
-def _poll_transfer_target(scene, obj):
-    # Accept only mesh objects and exclude the current source mesh (stored on Scene).
-    if not obj or getattr(obj, 'type', None) != 'MESH':
-        return False
-    src_name = getattr(scene, 'skv_transfer_source_name', '')
-    return (not src_name) or (obj.name != src_name)
-
-
-def _object_pick_update(props, context):
-    # Make the picked mesh the active object.
-    obj = getattr(props, 'object_pick', None)
-    if not obj or getattr(obj, 'type', None) != 'MESH':
-        return
-    context.view_layer.objects.active = obj
-    try:
-        obj.select_set(True)
-    except Exception:
-        pass
-    tag_redraw_view3d(context)
-
 from .common import (
     enum_groups_for_active_object,
     show_select_update,
-    get_active_object,
     get_shape_key_data,
     has_group_storage,
     is_initialized,
@@ -60,8 +35,44 @@ from . import groups
 from . import presets
 from . import meshDataTransfer
 
+
+def _poll_mesh_object(self, obj):
+    # Accept only mesh objects.
+    return bool(obj) and getattr(obj, "type", None) == "MESH"
+
+
+def _poll_transfer_target(scene, obj):
+    # Accept only mesh objects and exclude the current source mesh (stored on Scene).
+    if not obj or getattr(obj, "type", None) != "MESH":
+        return False
+    src_name = getattr(scene, "skv_transfer_source_name", "")
+    return (not src_name) or (obj.name != src_name)
+
+
+def _object_pick_update(props, context):
+    # Clear scan status when user changes the object in UI.
+    try:
+        props.scan_status = ""
+    except Exception:
+        pass
+
+    # Make the picked mesh the active object.
+    obj = getattr(props, "object_pick", None)
+    if not obj or getattr(obj, "type", None) != "MESH":
+        tag_redraw_view3d(context)
+        return
+
+    context.view_layer.objects.active = obj
+    try:
+        obj.select_set(True)
+    except Exception:
+        pass
+
+    tag_redraw_view3d(context)
+
+
 # -----------------------------
-# Operators (init/rescan + search clear)
+# Operators (scan + search clear)
 # -----------------------------
 class SKV_OT_SearchClear(Operator):
     bl_idname = "skv.search_clear"
@@ -75,9 +86,10 @@ class SKV_OT_SearchClear(Operator):
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
+
 class SKV_OT_InitRescan(Operator):
     bl_idname = "skv.init_rescan"
-    bl_label = "Scan/Rescan"
+    bl_label = "Scan"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -85,23 +97,18 @@ class SKV_OT_InitRescan(Operator):
 
         props = context.scene.skv_props
 
-        # Use the user-selected mesh (if any) as the active context object.
-        picked_obj = getattr(props, "object_pick", None)
-        if picked_obj and getattr(picked_obj, "type", None) == "MESH":
-            obj = picked_obj
-        else:
-            obj = get_active_object(context)
-            if obj and getattr(obj, "type", None) == "MESH":
-                props.object_pick = obj
-
-        if not obj:
-            self.report({"WARNING"}, "Active object has no shape keys support.")
+        # Do NOT auto-pick any object when the field is empty.
+        obj = getattr(props, "object_pick", None)
+        if not obj or getattr(obj, "type", None) != "MESH":
+            self.report({"WARNING"}, "Object is not selected.")
             return {"CANCELLED"}
 
         key_data = get_shape_key_data(obj)
-        if not key_data:
-            self.report({"WARNING"}, "No shape keys datablock on this object.")
-            return {"CANCELLED"}
+        if not key_data or not getattr(key_data, "key_blocks", None):
+            # Requirement: show message under Scan when no shape keys were found.
+            props.scan_status = "No Shape Keys found."
+            tag_redraw_view3d(context)
+            return {"FINISHED"}
 
         if not has_group_storage(key_data):
             self.report({"ERROR"}, "Group storage is not available on this Key datablock.")
@@ -112,13 +119,16 @@ class SKV_OT_InitRescan(Operator):
             return {"CANCELLED"}
 
         ensure_init_setup_write(obj)
+
+        # Clear failure message on success.
+        props.scan_status = ""
         tag_redraw_view3d(context)
         return {"FINISHED"}
+
 
 # -----------------------------
 # Scene Props (UI state)
 # -----------------------------
-
 def transfer_open_update(self, context):
     # Clear last transfer status when the module is collapsed.
     if not getattr(self, "transfer_open", False):
@@ -129,18 +139,22 @@ def transfer_open_update(self, context):
             except Exception:
                 pass
 
+
 class SKV_Props(PropertyGroup):
     keys_index: IntProperty(name="Keys Index", default=-1, min=-1)
     search: StringProperty(name="Search", default="")
     show_select: BoolProperty(name="Select", default=False, update=show_select_update)
     groups_module_open: BoolProperty(name="Groups", default=True)
+
     object_pick: PointerProperty(
-        name='Object',
+        name="Object",
         type=bpy.types.Object,
         poll=_poll_mesh_object,
         update=_object_pick_update,
     )
 
+    # Status shown under Scan button after failed scan (skip saving to .blend).
+    scan_status: StringProperty(name="Scan Status", default="", options={"SKIP_SAVE"})
 
     groups_open: BoolProperty(name="Groups", default=True)
     keys_open: BoolProperty(name="Keys", default=True)
@@ -167,6 +181,7 @@ class SKV_Props(PropertyGroup):
     last_affix_name: StringProperty(name="Last Affix Name", default="")
     last_affix_pending: BoolProperty(name="Last Affix Pending", default=False)
 
+
 # -----------------------------
 # Panel
 # -----------------------------
@@ -180,38 +195,51 @@ class SKV_PT_ShapeKeysPanel(Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.skv_props
-
-        obj = get_active_object(context)
+        obj = getattr(props, "object_pick", None)
 
         # CONTEXT
         box_ctx = layout.box()
         row = box_ctx.row(align=True)
         row.label(text="OBJECT", icon="OBJECT_DATA")
 
-        if not obj:
-            box_ctx.label(text="No supported active mesh")
-            return
-
         row2 = box_ctx.row(align=True)
         row2.prop(props, "object_pick", text="", icon="MESH_DATA")
 
+        # Rescan icon appears ONLY after successful initialization for this object.
+        can_rescan = False
+        if obj and getattr(obj, "type", None) == "MESH":
+            key_data = get_shape_key_data(obj)
+            if key_data and has_group_storage(key_data) and is_initialized(key_data):
+                can_rescan = True
+
+        if can_rescan:
+            row2.operator("skv.init_rescan", text="", icon="FILE_REFRESH")
+
+        # Scan button under object field with small gap.
+        # After successful scan, Scan should disappear for this object (leave only Rescan).
+        if not can_rescan:
+            box_ctx.separator()
+            row_scan = box_ctx.row()
+            row_scan.operator("skv.init_rescan", text="Scan", icon="VIEWZOOM")
+
+            # Message under Scan after failed scan (no shape keys found).
+            if props.scan_status:
+                box_ctx.separator()
+                box_ctx.label(text=props.scan_status, icon="INFO")
+
+        # Stop here if no object is selected.
+        if not obj:
+            return
+
         key_data = get_shape_key_data(obj)
         if not key_data or not getattr(key_data, "key_blocks", None):
-            layout.label(text="No Shape Keys for selected object")
             return
 
         if not has_group_storage(key_data):
-            layout.label(text="Group storage not available.")
             return
 
         initialized = is_initialized(key_data)
-
-        if initialized:
-            row2.operator("skv.init_rescan", text="", icon="FILE_REFRESH")
-
         if not initialized:
-            layout.separator()
-            layout.operator("skv.init_rescan", text="Scan")
             return
 
         current_group = get_selected_group_name(key_data) if initialized else INIT_GROUP_NAME
@@ -321,6 +349,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
                     rows=rows,
                 )
 
+
 # -----------------------------
 # Registration
 # -----------------------------
@@ -333,13 +362,14 @@ _LOCAL_CLASSES = (
 
 _ALL_CLASSES = _LOCAL_CLASSES + groups.CLASSES + presets.CLASSES + meshDataTransfer.CLASSES
 
+
 def register():
     for cls in _ALL_CLASSES:
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.skv_props = PointerProperty(type=SKV_Props)
     # Transfer-to dialog storage (Scene-level datablock properties support eyedropper).
-    bpy.types.Scene.skv_transfer_source_name = StringProperty(options={'SKIP_SAVE'})
+    bpy.types.Scene.skv_transfer_source_name = StringProperty(options={"SKIP_SAVE"})
     bpy.types.Scene.skv_transfer_target = PointerProperty(type=bpy.types.Object, poll=_poll_transfer_target)
 
     bpy.types.Key.skv_groups = CollectionProperty(type=groups.SKV_Group)
@@ -353,6 +383,7 @@ def register():
 
     bpy.types.Object.skv_mesh_data_transfer = PointerProperty(type=meshDataTransfer.SKV_MeshDataSettings)
 
+
 def unregister():
     del bpy.types.Object.skv_mesh_data_transfer
 
@@ -362,14 +393,16 @@ def unregister():
     del bpy.types.Key.skv_selected
     del bpy.types.Key.skv_groups
     del bpy.types.Key.skv_group_index
-    if hasattr(bpy.types.Scene, 'skv_transfer_target'):
+
+    if hasattr(bpy.types.Scene, "skv_transfer_target"):
         del bpy.types.Scene.skv_transfer_target
-    if hasattr(bpy.types.Scene, 'skv_transfer_source_name'):
+    if hasattr(bpy.types.Scene, "skv_transfer_source_name"):
         del bpy.types.Scene.skv_transfer_source_name
     del bpy.types.Scene.skv_props
 
     for cls in reversed(_ALL_CLASSES):
         bpy.utils.unregister_class(cls)
+
 
 if __name__ == "__main__":
     register()
