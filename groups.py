@@ -118,13 +118,10 @@ class SKV_UL_key_blocks(UIList):
         # Shape key slider / name
         row.prop(kb, "value", text=kb.name, slider=True)
 
-        # Visibility toggle (mute) + delete button
+        # Visibility toggle (mute)
         vis_icon = "HIDE_ON" if kb.mute else "HIDE_OFF"
         opv = row.operator("skv.shape_key_toggle_visibility", text="", icon=vis_icon, emboss=False)
         opv.key_name = kb.name
-
-        opd = row.operator("skv.shape_key_delete", text="", icon="TRASH", emboss=False)
-        opd.key_name = kb.name
 
 
 # -----------------------------
@@ -199,49 +196,6 @@ class SKV_OT_ShapeKeyToggleVisibility(Operator):
             return {"CANCELLED"}
 
         kb.mute = not kb.mute
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
-
-
-class SKV_OT_ShapeKeyDelete(Operator):
-    bl_idname = "skv.shape_key_delete"
-    bl_label = "Delete Shape Key"
-    bl_options = {"REGISTER", "UNDO"}
-
-    key_name: StringProperty(name="Shape Key Name", default="")
-
-    @classmethod
-    def poll(cls, context):
-        obj = get_active_object(context)
-        key_data = get_shape_key_data(obj) if obj else None
-        return bool(obj and key_data and getattr(key_data, "key_blocks", None))
-
-    def execute(self, context):
-        from .common import ensure_init_setup_write
-
-        obj = get_active_object(context)
-        key_data = get_shape_key_data(obj) if obj else None
-        if not obj or not key_data:
-            return {"CANCELLED"}
-
-        if self.key_name == "Basis":
-            self.report({"WARNING"}, "Cannot delete Basis")
-            return {"CANCELLED"}
-
-        kb = key_data.key_blocks.get(self.key_name)
-        if not kb:
-            self.report({"WARNING"}, "Shape Key not found")
-            return {"CANCELLED"}
-
-        try:
-            obj.shape_key_remove(kb)
-        except Exception as ex:
-            self.report({"ERROR"}, f"Failed to delete Shape Key: {ex}")
-            return {"CANCELLED"}
-
-        # Rebuild addon storage/mapping after deletion.
-        ensure_init_setup_write(obj)
-
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
@@ -780,8 +734,25 @@ class SKV_OT_TransferTo(Operator):
             self.report({"WARNING"}, "Nothing transferred")
             return {"CANCELLED"}
 
-        # Clear selection UI after successful transfer.
+        # Clear selection UI after successful transfer (on source).
         clear_selection_ui(context, key_data)
+
+        # Switch scene selection/focus to target (equivalent to clicking target).
+        view_layer = context.view_layer
+        try:
+            for ob in list(view_layer.objects):
+                if ob.select_get():
+                    ob.select_set(False)
+        except Exception:
+            pass
+
+        try:
+            target.select_set(True)
+        except Exception:
+            pass
+
+        view_layer.objects.active = target
+
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
@@ -804,6 +775,5 @@ CLASSES = (
     SKV_OT_GroupRename,
     SKV_OT_CreateGroupFromSelected,
     SKV_OT_ShapeKeyToggleVisibility,
-    SKV_OT_ShapeKeyDelete,
     SKV_OT_TransferTo,
 )

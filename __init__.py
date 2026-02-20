@@ -9,6 +9,7 @@ bl_info = {
 }
 
 import bpy
+from bpy.app.handlers import persistent
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import (
     BoolProperty,
@@ -36,6 +37,9 @@ from . import presets
 from . import meshDataTransfer
 
 
+# -----------------------------
+# Poll helpers
+# -----------------------------
 def _poll_mesh_object(self, obj):
     # Accept only mesh objects.
     return bool(obj) and getattr(obj, "type", None) == "MESH"
@@ -49,30 +53,91 @@ def _poll_transfer_target(scene, obj):
     return (not src_name) or (obj.name != src_name)
 
 
-def _object_pick_update(props, context):
-    # Clear scan status when user changes the object in UI.
-    try:
-        props.scan_status = ""
-    except Exception:
-        pass
+# -----------------------------
+# Automatic object sync + auto-scan
+# -----------------------------
+_SKV_SYNC_GUARD = False
 
-    # Make the picked mesh the active object.
-    obj = getattr(props, "object_pick", None)
-    if not obj or getattr(obj, "type", None) != "MESH":
-        tag_redraw_view3d(context)
+
+def _auto_process_active_object(scene):
+    """
+    Sync selected object with scene selection and automatically initialize
+    addon storage when a mesh object with shape keys becomes active.
+    """
+    global _SKV_SYNC_GUARD
+    if _SKV_SYNC_GUARD:
         return
 
-    context.view_layer.objects.active = obj
-    try:
-        obj.select_set(True)
-    except Exception:
-        pass
+    props = getattr(scene, "skv_props", None)
+    if not props:
+        return
 
-    tag_redraw_view3d(context)
+    ctx = bpy.context
+    active = getattr(ctx, "active_object", None)
+
+    desired = active if (active and getattr(active, "type", None) == "MESH") else None
+    desired_name = desired.name if desired else ""
+
+    if getattr(props, "last_active_object_name", "") == desired_name:
+        return
+
+    _SKV_SYNC_GUARD = True
+    try:
+        props.last_active_object_name = desired_name
+        props.object_pick = desired
+
+        # Reset scan status on any change first.
+        props.scan_status = ""
+
+        if not desired:
+            tag_redraw_view3d(ctx)
+            return
+
+        key_data = get_shape_key_data(desired)
+        if not key_data or not getattr(key_data, "key_blocks", None):
+            props.scan_status = "No Shape Keys found."
+            tag_redraw_view3d(ctx)
+            return
+
+        if not has_group_storage(key_data):
+            # No explicit UI requirement here; avoid spamming.
+            tag_redraw_view3d(ctx)
+            return
+
+        if getattr(key_data, "library", None) is not None:
+            # Linked/read-only: do not attempt initialization.
+            tag_redraw_view3d(ctx)
+            return
+
+        if not is_initialized(key_data):
+            from .common import ensure_init_setup_write
+
+            ensure_init_setup_write(desired)
+
+        tag_redraw_view3d(ctx)
+    finally:
+        _SKV_SYNC_GUARD = False
+
+
+@persistent
+def _depsgraph_update_post(scene, depsgraph):
+    _auto_process_active_object(scene)
+
+
+def _ensure_handler_installed():
+    h = bpy.app.handlers.depsgraph_update_post
+    if _depsgraph_update_post not in h:
+        h.append(_depsgraph_update_post)
+
+
+def _ensure_handler_removed():
+    h = bpy.app.handlers.depsgraph_update_post
+    if _depsgraph_update_post in h:
+        h.remove(_depsgraph_update_post)
 
 
 # -----------------------------
-# Operators (scan + search clear)
+# Operators (kept for internal/testing, not used by UI)
 # -----------------------------
 class SKV_OT_SearchClear(Operator):
     bl_idname = "skv.search_clear"
@@ -83,45 +148,6 @@ class SKV_OT_SearchClear(Operator):
         if hasattr(context.scene, "skv_props"):
             context.scene.skv_props.search = ""
             context.scene.skv_props.keys_index = -1
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
-
-
-class SKV_OT_InitRescan(Operator):
-    bl_idname = "skv.init_rescan"
-    bl_label = "Scan"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        from .common import ensure_init_setup_write
-
-        props = context.scene.skv_props
-
-        # Do NOT auto-pick any object when the field is empty.
-        obj = getattr(props, "object_pick", None)
-        if not obj or getattr(obj, "type", None) != "MESH":
-            self.report({"WARNING"}, "Object is not selected.")
-            return {"CANCELLED"}
-
-        key_data = get_shape_key_data(obj)
-        if not key_data or not getattr(key_data, "key_blocks", None):
-            # Requirement: show message under Scan when no shape keys were found.
-            props.scan_status = "No Shape Keys found."
-            tag_redraw_view3d(context)
-            return {"FINISHED"}
-
-        if not has_group_storage(key_data):
-            self.report({"ERROR"}, "Group storage is not available on this Key datablock.")
-            return {"CANCELLED"}
-
-        if getattr(key_data, "library", None) is not None:
-            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
-            return {"CANCELLED"}
-
-        ensure_init_setup_write(obj)
-
-        # Clear failure message on success.
-        props.scan_status = ""
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
@@ -146,14 +172,21 @@ class SKV_Props(PropertyGroup):
     show_select: BoolProperty(name="Select", default=False, update=show_select_update)
     groups_module_open: BoolProperty(name="Groups", default=True)
 
+    # Current mesh selected in the scene (synced via depsgraph handler).
     object_pick: PointerProperty(
         name="Object",
         type=bpy.types.Object,
         poll=_poll_mesh_object,
-        update=_object_pick_update,
     )
 
-    # Status shown under Scan button after failed scan (skip saving to .blend).
+    # Stores the last seen active object name to avoid repeated re-init.
+    last_active_object_name: StringProperty(
+        name="Last Active Object Name",
+        default="",
+        options={"SKIP_SAVE"},
+    )
+
+    # Status shown under object label (skip saving to .blend).
     scan_status: StringProperty(name="Scan Status", default="", options={"SKIP_SAVE"})
 
     groups_open: BoolProperty(name="Groups", default=True)
@@ -203,46 +236,25 @@ class SKV_PT_ShapeKeysPanel(Panel):
         row.label(text="OBJECT", icon="OBJECT_DATA")
 
         row2 = box_ctx.row(align=True)
-        row2.prop(props, "object_pick", text="", icon="MESH_DATA")
+        row2.label(text=obj.name if obj else "No selected object", icon="MESH_DATA")
 
-        # Rescan icon appears ONLY after successful initialization for this object.
-        can_rescan = False
-        if obj and getattr(obj, "type", None) == "MESH":
-            key_data = get_shape_key_data(obj)
-            if key_data and has_group_storage(key_data) and is_initialized(key_data):
-                can_rescan = True
-
-        if can_rescan:
-            row2.operator("skv.init_rescan", text="", icon="FILE_REFRESH")
-
-        # Scan button under object field with small gap.
-        # After successful scan, Scan should disappear for this object (leave only Rescan).
-        if not can_rescan:
+        if props.scan_status:
             box_ctx.separator()
-            row_scan = box_ctx.row()
-            row_scan.operator("skv.init_rescan", text="Scan", icon="VIEWZOOM")
+            box_ctx.label(text=props.scan_status, icon="INFO")
 
-            # Message under Scan after failed scan (no shape keys found).
-            if props.scan_status:
-                box_ctx.separator()
-                box_ctx.label(text=props.scan_status, icon="INFO")
-
-        # Stop here if no object is selected.
+        # Stop here if no suitable object selected.
         if not obj:
             return
 
         key_data = get_shape_key_data(obj)
         if not key_data or not getattr(key_data, "key_blocks", None):
             return
-
         if not has_group_storage(key_data):
             return
-
-        initialized = is_initialized(key_data)
-        if not initialized:
+        if not is_initialized(key_data):
             return
 
-        current_group = get_selected_group_name(key_data) if initialized else INIT_GROUP_NAME
+        current_group = get_selected_group_name(key_data) or INIT_GROUP_NAME
 
         # GROUP WORKSPACE
         box_ws = layout.box()
@@ -317,7 +329,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
         headp.prop(props, "presets_open", text="", emboss=False, icon=iconp)
         headp.label(text="PRESETS")
 
-        if initialized and props.presets_open:
+        if props.presets_open:
             row = boxp.row()
             row.template_list(
                 "SKV_UL_presets",
@@ -355,7 +367,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
 # -----------------------------
 _LOCAL_CLASSES = (
     SKV_OT_SearchClear,
-    SKV_OT_InitRescan,
     SKV_Props,
     SKV_PT_ShapeKeysPanel,
 )
@@ -383,8 +394,13 @@ def register():
 
     bpy.types.Object.skv_mesh_data_transfer = PointerProperty(type=meshDataTransfer.SKV_MeshDataSettings)
 
+    _ensure_handler_installed()
+    _auto_process_active_object(bpy.context.scene)
+
 
 def unregister():
+    _ensure_handler_removed()
+
     del bpy.types.Object.skv_mesh_data_transfer
 
     del bpy.types.Key.skv_preset_index
