@@ -1,3 +1,4 @@
+# __init__.py
 bl_info = {
     "name": "Shape Keys Viewer",
     "author": "xtafr001",
@@ -100,12 +101,10 @@ def _auto_process_active_object(scene):
             return
 
         if not has_group_storage(key_data):
-            # No explicit UI requirement here; avoid spamming.
             tag_redraw_view3d(ctx)
             return
 
         if getattr(key_data, "library", None) is not None:
-            # Linked/read-only: do not attempt initialization.
             tag_redraw_view3d(ctx)
             return
 
@@ -137,7 +136,7 @@ def _ensure_handler_removed():
 
 
 # -----------------------------
-# Operators (kept for internal/testing, not used by UI)
+# Operators
 # -----------------------------
 class SKV_OT_SearchClear(Operator):
     bl_idname = "skv.search_clear"
@@ -191,7 +190,17 @@ class SKV_Props(PropertyGroup):
 
     groups_open: BoolProperty(name="Groups", default=True)
     keys_open: BoolProperty(name="Keys", default=True)
+
     presets_open: BoolProperty(name="Presets", default=False)
+    presets_scope: EnumProperty(
+        name="Scope",
+        items=[
+            ("LOCAL", "Local", "Presets affect the active object only"),
+            ("GLOBAL", "Global", "Presets affect multiple objects"),
+        ],
+        default="LOCAL",
+    )
+
     transfer_open: BoolProperty(name="Shape Keys Transfer", default=False, update=transfer_open_update)
     move_to_group: EnumProperty(name="Move To", items=enum_groups_for_active_object)
 
@@ -330,36 +339,73 @@ class SKV_PT_ShapeKeysPanel(Panel):
         headp.label(text="PRESETS")
 
         if props.presets_open:
-            row = boxp.row()
-            row.template_list(
-                "SKV_UL_presets",
-                "",
-                key_data,
-                "skv_presets",
-                key_data,
-                "skv_preset_index",
-                rows=4,
-            )
-            col = row.column(align=True)
-            col.operator("skv.preset_add_empty", icon="ADD", text="")
-            col.operator("skv.preset_remove", icon="REMOVE", text="")
-            col.separator()
-            col.operator("skv.preset_rename", icon="GREASEPENCIL", text="")
+            scope_row = boxp.row(align=True)
+            scope_row.prop(props, "presets_scope", expand=True)
 
-            preset = get_active_preset(key_data)
-            if preset:
-                boxp.separator()
-                boxp.label(text="Preset Keys")
-                rows = min(10, max(3, len(preset.items))) if preset.items else 3
-                boxp.template_list(
-                    "SKV_UL_preset_key_sliders",
+            if props.presets_scope == "LOCAL":
+                row = boxp.row()
+                row.template_list(
+                    "SKV_UL_presets",
                     "",
-                    preset,
-                    "items",
-                    preset,
-                    "items_index",
-                    rows=rows,
+                    key_data,
+                    "skv_presets",
+                    key_data,
+                    "skv_preset_index",
+                    rows=4,
                 )
+                col = row.column(align=True)
+                col.operator("skv.preset_add_empty", icon="ADD", text="")
+                col.operator("skv.preset_remove", icon="REMOVE", text="")
+                col.separator()
+                col.operator("skv.preset_rename", icon="GREASEPENCIL", text="")
+
+                preset = get_active_preset(key_data)
+                if preset:
+                    boxp.separator()
+                    boxp.label(text="Preset Keys")
+                    rows = min(10, max(3, len(preset.items))) if preset.items else 3
+                    boxp.template_list(
+                        "SKV_UL_preset_key_sliders",
+                        "",
+                        preset,
+                        "items",
+                        preset,
+                        "items_index",
+                        rows=rows,
+                    )
+
+            else:
+                scene = context.scene
+                row = boxp.row()
+                row.template_list(
+                    "SKV_UL_global_presets",
+                    "",
+                    scene,
+                    "skv_global_presets",
+                    scene,
+                    "skv_global_preset_index",
+                    rows=4,
+                )
+                col = row.column(align=True)
+                col.operator("skv.global_preset_add_empty", icon="ADD", text="")
+                col.operator("skv.global_preset_remove", icon="REMOVE", text="")
+                col.separator()
+                col.operator("skv.global_preset_rename", icon="GREASEPENCIL", text="")
+
+                gpreset = presets.get_active_global_preset(scene)
+                if gpreset:
+                    boxp.separator()
+                    boxp.label(text="Global Preset Keys")
+                    rows = min(10, max(3, len(gpreset.items))) if gpreset.items else 3
+                    boxp.template_list(
+                        "SKV_UL_global_preset_key_sliders",
+                        "",
+                        gpreset,
+                        "items",
+                        gpreset,
+                        "items_index",
+                        rows=rows,
+                    )
 
 
 # -----------------------------
@@ -379,6 +425,11 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.skv_props = PointerProperty(type=SKV_Props)
+
+    # Global presets storage on Scene
+    bpy.types.Scene.skv_global_presets = CollectionProperty(type=presets.SKV_GlobalPreset)
+    bpy.types.Scene.skv_global_preset_index = IntProperty(name="Global Preset Index", default=0, min=0)
+
     # Transfer-to dialog storage (Scene-level datablock properties support eyedropper).
     bpy.types.Scene.skv_transfer_source_name = StringProperty(options={"SKIP_SAVE"})
     bpy.types.Scene.skv_transfer_target = PointerProperty(type=bpy.types.Object, poll=_poll_transfer_target)
@@ -414,6 +465,12 @@ def unregister():
         del bpy.types.Scene.skv_transfer_target
     if hasattr(bpy.types.Scene, "skv_transfer_source_name"):
         del bpy.types.Scene.skv_transfer_source_name
+
+    if hasattr(bpy.types.Scene, "skv_global_preset_index"):
+        del bpy.types.Scene.skv_global_preset_index
+    if hasattr(bpy.types.Scene, "skv_global_presets"):
+        del bpy.types.Scene.skv_global_presets
+
     del bpy.types.Scene.skv_props
 
     for cls in reversed(_ALL_CLASSES):

@@ -157,9 +157,15 @@ class SKV_MT_SelectActions(Menu):
 
         layout.separator()
 
-        # Section: presets
+        # Section: local presets
         layout.menu("SKV_MT_add_to_preset", text="Add to preset", icon="PRESET")
         layout.operator("skv.preset_add_from_selected", text="Create new preset", icon="PRESET")
+
+        layout.separator()
+
+        # Section: global presets
+        layout.menu("SKV_MT_add_to_global_preset", text="Add to global preset", icon="PRESET")
+        layout.operator("skv.global_preset_add_from_selected", text="Create new global preset", icon="PRESET")
 
         layout.separator()
 
