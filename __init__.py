@@ -1,4 +1,3 @@
-# __init__.py
 bl_info = {
     "name": "Shape Keys Viewer",
     "author": "xtafr001",
@@ -152,6 +151,63 @@ def _active_keys_update_from_values(obj) -> None:
             continue
 
 
+def _auto_keyframe_update(scene, obj) -> None:
+    """Auto-insert keyframes for shape key values.
+
+    Uses per-key entries stored on Key datablock (key_data.skv_auto_keyframes).
+
+    Policy:
+      - If frame changed since last check: update tracking state, do not insert.
+      - If value changed while staying on the same frame: insert a keyframe.
+    """
+    if not obj or getattr(obj, "type", None) != "MESH":
+        return
+
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return
+
+    if not hasattr(key_data, "skv_auto_keyframes") or not key_data.skv_auto_keyframes:
+        return
+
+    if getattr(key_data, "library", None) is not None:
+        return
+
+    frame = int(scene.frame_current)
+    eps = 1e-6
+
+    for it in key_data.skv_auto_keyframes:
+        if not getattr(it, "enabled", False):
+            continue
+        name = (it.name or "").strip()
+        if not name:
+            continue
+
+        kb = key_data.key_blocks.get(name)
+        if not kb:
+            continue
+
+        try:
+            cur_val = float(kb.value)
+        except Exception:
+            cur_val = 0.0
+
+        last_frame = int(getattr(it, "last_frame", -999999))
+        last_val = float(getattr(it, "last_value", cur_val))
+
+        if frame != last_frame:
+            it.last_frame = frame
+            it.last_value = cur_val
+            continue
+
+        if abs(cur_val - last_val) > eps:
+            try:
+                key_data.keyframe_insert(data_path=f'key_blocks["{kb.name}"].value', frame=frame)
+            except Exception:
+                pass
+            it.last_value = cur_val
+
+
 # -----------------------------
 # Automatic object sync + auto-scan
 # -----------------------------
@@ -229,6 +285,7 @@ def _depsgraph_update_post(scene, depsgraph):
         obj = getattr(bpy.context, "active_object", None)
         if obj and getattr(obj, "type", None) == "MESH":
             _active_keys_update_from_values(obj)
+            _auto_keyframe_update(scene, obj)
     except Exception:
         pass
 
@@ -385,6 +442,10 @@ class SKV_PT_ShapeKeysPanel(Panel):
         selected_names = set(kd_selected_set(key_data))
         has_selected_valid = any(n and n != "Basis" for n in selected_names)
 
+        # presets presence gates for "Add to preset" / "Add to global preset"
+        has_local_presets = hasattr(key_data, "skv_presets") and (len(key_data.skv_presets) > 0)
+        has_global_presets = hasattr(context.scene, "skv_global_presets") and (len(context.scene.skv_global_presets) > 0)
+
         # SHAPE KEYS (workspace)
         box_ws = layout.box()
         head_ws = box_ws.row(align=True)
@@ -467,14 +528,20 @@ class SKV_PT_ShapeKeysPanel(Panel):
                     r1.menu("SKV_MT_move_to_group", text="Move to group", icon="FILE_FOLDER")
                     r1.operator("skv.create_group_from_selected", text="Create group", icon="NEWFOLDER")
 
+                    # Local presets: menu enabled only if presets exist; create button stays on selected-only.
                     r2 = box_keys.row(align=True)
                     r2.enabled = has_selected_valid
-                    r2.menu("SKV_MT_add_to_preset", text="Add to preset", icon="PRESET")
+                    r2m = r2.row(align=True)
+                    r2m.enabled = has_selected_valid and has_local_presets
+                    r2m.menu("SKV_MT_add_to_preset", text="Add to local preset", icon="PRESET")
                     r2.operator("skv.preset_add_from_selected", text="Create local preset", icon="PRESET")
 
+                    # Global presets: menu enabled only if presets exist; create button stays on selected-only.
                     r3 = box_keys.row(align=True)
                     r3.enabled = has_selected_valid
-                    r3.menu("SKV_MT_add_to_global_preset", text="Add to global preset", icon="PRESET")
+                    r3m = r3.row(align=True)
+                    r3m.enabled = has_selected_valid and has_global_presets
+                    r3m.menu("SKV_MT_add_to_global_preset", text="Add to global preset", icon="PRESET")
                     r3.operator(
                         "skv.global_preset_add_from_selected",
                         text="Create global preset",
@@ -623,13 +690,21 @@ def register():
     bpy.types.Key.skv_active_keys = CollectionProperty(type=groups.SKV_ActiveKeyEntry)
     bpy.types.Key.skv_active_keys_index = IntProperty(name="Active Keys Index", default=-1, min=-1)
 
+    # Auto keyframe tracking per shape key (stored on Key datablock)
+    bpy.types.Key.skv_auto_keyframes = CollectionProperty(type=groups.SKV_AutoKeyframeEntry)
+
     bpy.types.Key.skv_presets = CollectionProperty(type=presets.SKV_Preset)
     bpy.types.Key.skv_preset_index = IntProperty(name="Preset Index", default=0, min=0)
 
     bpy.types.Object.skv_mesh_data_transfer = PointerProperty(type=meshDataTransfer.SKV_MeshDataSettings)
 
     _ensure_handler_installed()
-    _auto_process_active_object(bpy.context.scene)
+    try:
+        scene = bpy.context.scene
+    except Exception:
+        scene = None
+    if scene is not None:
+        _auto_process_active_object(scene)
 
 
 def unregister():
@@ -646,6 +721,9 @@ def unregister():
         del bpy.types.Key.skv_active_keys
     if hasattr(bpy.types.Key, "skv_key_defaults"):
         del bpy.types.Key.skv_key_defaults
+
+    if hasattr(bpy.types.Key, "skv_auto_keyframes"):
+        del bpy.types.Key.skv_auto_keyframes
 
     del bpy.types.Key.skv_key_groups
     del bpy.types.Key.skv_selected

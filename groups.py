@@ -1,4 +1,3 @@
-# groups.py
 import bpy
 from bpy.types import Operator, PropertyGroup, UIList, Menu
 from bpy.props import (
@@ -55,6 +54,26 @@ class SKV_KeyDefaultEntry(PropertyGroup):
 
 class SKV_ActiveKeyEntry(PropertyGroup):
     name: StringProperty(name="Key Name", default="")
+
+
+class SKV_AutoKeyframeEntry(PropertyGroup):
+    name: StringProperty(name="Key Name", default="")
+    enabled: BoolProperty(name="Enabled", default=False)
+    last_frame: IntProperty(name="Last Frame", default=-999999)
+    last_value: FloatProperty(name="Last Value", default=0.0)
+
+
+def _autokf_get_entry(key_data, key_name: str, create: bool = False):
+    if not key_data or not hasattr(key_data, "skv_auto_keyframes"):
+        return None
+    for it in key_data.skv_auto_keyframes:
+        if it.name == key_name:
+            return it
+    if not create:
+        return None
+    it = key_data.skv_auto_keyframes.add()
+    it.name = key_name
+    return it
 
 
 # -----------------------------
@@ -133,6 +152,13 @@ class SKV_UL_key_blocks(UIList):
         vis_icon = "HIDE_ON" if kb.mute else "HIDE_OFF"
         opv = row.operator("skv.shape_key_toggle_visibility", text="", icon=vis_icon, emboss=False)
         opv.key_name = kb.name
+
+        # Auto keyframe toggle
+        entry = _autokf_get_entry(key_data, kb.name, create=False)
+        kf_enabled = bool(entry.enabled) if entry else False
+        kf_icon = "KEYFRAME_HLT" if kf_enabled else "KEYFRAME"
+        opk = row.operator("skv.auto_keyframe_toggle", text="", icon=kf_icon, emboss=False)
+        opk.key_name = kb.name
 
 
 class SKV_UL_active_keys(UIList):
@@ -291,6 +317,62 @@ class SKV_OT_ShapeKeyToggleVisibility(Operator):
         return {"FINISHED"}
 
 
+class SKV_OT_AutoKeyframeToggle(Operator):
+    bl_idname = "skv.auto_keyframe_toggle"
+    bl_label = "Toggle Auto Keyframe"
+    bl_options = {"REGISTER", "UNDO"}
+
+    key_name: StringProperty(name="Shape Key Name", default="")
+
+    @classmethod
+    def poll(cls, context):
+        obj = get_active_object(context)
+        key_data = get_shape_key_data(obj) if obj else None
+        return bool(key_data and getattr(key_data, "key_blocks", None))
+
+    def execute(self, context):
+        obj = get_active_object(context)
+        key_data = get_shape_key_data(obj) if obj else None
+        if not obj or not key_data or not getattr(key_data, "key_blocks", None):
+            return {"CANCELLED"}
+
+        if getattr(key_data, "library", None) is not None:
+            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
+            return {"CANCELLED"}
+
+        name = (self.key_name or "").strip()
+        if not name:
+            return {"CANCELLED"}
+
+        kb = key_data.key_blocks.get(name)
+        if not kb:
+            self.report({"WARNING"}, "Shape Key not found")
+            return {"CANCELLED"}
+
+        entry = _autokf_get_entry(key_data, name, create=True)
+        entry.enabled = not bool(entry.enabled)
+
+        frame = int(context.scene.frame_current)
+        try:
+            entry.last_frame = frame
+        except Exception:
+            pass
+        try:
+            entry.last_value = float(kb.value)
+        except Exception:
+            entry.last_value = 0.0
+
+        # When enabling, insert an initial keyframe at current frame.
+        if entry.enabled:
+            try:
+                key_data.keyframe_insert(data_path=f'key_blocks["{kb.name}"].value', frame=frame)
+            except Exception:
+                pass
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+
 class SKV_OT_KeyToggleSelect(Operator):
     bl_idname = "skv.key_toggle_select"
     bl_label = "Toggle Shape Key Selection"
@@ -422,60 +504,69 @@ class SKV_OT_MoveSelectedToGroup(Operator):
     bl_label = "Move Selected To Group"
     bl_options = {"REGISTER", "UNDO"}
 
-    group: bpy.props.EnumProperty(name="Group", items=enum_groups_for_active_object)
+    group: StringProperty(name="Group", default=INIT_GROUP_NAME)
 
     def execute(self, context):
         obj = get_active_object(context)
-        if not obj:
+        key_data = get_shape_key_data(obj) if obj else None
+        if not obj or not key_data:
             return {"CANCELLED"}
 
-        key_data = get_shape_key_data(obj)
-        if not key_data or not key_data.key_blocks:
-            return {"CANCELLED"}
-
-        if getattr(key_data, "library", None) is not None:
-            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
-            return {"CANCELLED"}
-
-        ensure_init_setup_write(obj)
-
-        names = group_names(key_data)
-        if self.group not in names:
-            self.group = INIT_GROUP_NAME
-
+        group_name = (self.group or INIT_GROUP_NAME).strip() or INIT_GROUP_NAME
         selected = kd_selected_set(key_data)
-        if not selected:
-            self.report({"INFO"}, "No selected shape keys.")
-            return {"CANCELLED"}
+        for n in selected:
+            if n and n != "Basis":
+                kd_set_group(key_data, n, group_name)
 
-        moved = 0
-        for kb in key_data.key_blocks:
-            if kb.name in selected:
-                kd_set_group(key_data, kb.name, self.group)
-                moved += 1
-
-        if moved == 0:
-            self.report({"INFO"}, "No selected shape keys.")
-            return {"CANCELLED"}
-
-        clear_selection_ui(context, key_data)
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
 
 class SKV_OT_ResetGroupValues(Operator):
     bl_idname = "skv.reset_group_values"
-    bl_label = "Zero Values (Selected)"
-    bl_description = "Set value=0 only for selected shape keys in the current group"
+    bl_label = "Zero Selected Values"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         obj = get_active_object(context)
+        key_data = get_shape_key_data(obj) if obj else None
+        if not obj or not key_data:
+            return {"CANCELLED"}
+
+        selected = kd_selected_set(key_data)
+        for n in selected:
+            if not n or n == "Basis":
+                continue
+            kb = key_data.key_blocks.get(n)
+            if kb:
+                try:
+                    kb.value = 0.0
+                except Exception:
+                    pass
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+
+class SKV_OT_GroupAdd(Operator):
+    bl_idname = "skv.group_add"
+    bl_label = "Add Group"
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: StringProperty(name="Name", default="")
+
+    def invoke(self, context, event):
+        self.name = "New Group"
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        obj = get_active_object(context)
         if not obj:
+            self.report({"WARNING"}, "No supported active object.")
             return {"CANCELLED"}
 
         key_data = get_shape_key_data(obj)
-        if not key_data or not key_data.key_blocks:
+        if not key_data or not has_group_storage(key_data):
             return {"CANCELLED"}
 
         if getattr(key_data, "library", None) is not None:
@@ -488,63 +579,7 @@ class SKV_OT_ResetGroupValues(Operator):
 
         ensure_init_setup_write(obj)
 
-        group_name = get_selected_group_name(key_data)
-        selected = kd_selected_set(key_data)
-
-        if not selected:
-            self.report({"INFO"}, "No selected shape keys.")
-            return {"CANCELLED"}
-
-        changed = 0
-        for kb in key_data.key_blocks:
-            if kb.name not in selected:
-                continue
-            if kd_get_group(key_data, kb.name) != group_name:
-                continue
-            try:
-                kb.value = 0.0
-                changed += 1
-            except Exception:
-                pass
-
-        if changed == 0:
-            self.report({"INFO"}, "No keys were reset.")
-            return {"CANCELLED"}
-
-        kd_clear_selected(key_data)
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
-
-
-# --- Group operators ---
-class SKV_OT_GroupAdd(Operator):
-    bl_idname = "skv.group_add"
-    bl_label = "Add Group"
-    bl_options = {"REGISTER", "UNDO"}
-
-    name: StringProperty(name="Group Name", default="New Group")
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
-
-    def execute(self, context):
-        obj = get_active_object(context)
-        if not obj:
-            self.report({"WARNING"}, "No supported active object.")
-            return {"CANCELLED"}
-
-        key_data = get_shape_key_data(obj)
-        if not key_data or not has_group_storage(key_data):
-            self.report({"ERROR"}, "Group storage not available.")
-            return {"CANCELLED"}
-
-        if getattr(key_data, "library", None) is not None:
-            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
-            return {"CANCELLED"}
-
-        ensure_init_setup_write(obj)
-
-        new_name = self.name.strip()
+        new_name = (self.name or "").strip()
         if not new_name:
             self.report({"WARNING"}, "Group name is empty.")
             return {"CANCELLED"}
@@ -842,6 +877,7 @@ CLASSES = (
     SKV_KeyGroupEntry,
     SKV_KeyDefaultEntry,
     SKV_ActiveKeyEntry,
+    SKV_AutoKeyframeEntry,
     SKV_UL_Groups,
     SKV_UL_key_blocks,
     SKV_UL_active_keys,
@@ -849,6 +885,7 @@ CLASSES = (
     SKV_MT_SelectActions,
     SKV_OT_ActiveKeyRemove,
     SKV_OT_ShapeKeyToggleVisibility,
+    SKV_OT_AutoKeyframeToggle,
     SKV_OT_KeyToggleSelect,
     SKV_OT_SelectVisible,
     SKV_OT_SelectByAffix,
