@@ -32,6 +32,7 @@ from .common import (
     tag_redraw_view3d,
     get_active_preset,
     INIT_GROUP_NAME,
+    kd_selected_set,
 )
 from . import groups
 from . import presets
@@ -55,6 +56,103 @@ def _poll_transfer_target(scene, obj):
 
 
 # -----------------------------
+# Default value capture (for Active Shape Keys)
+# -----------------------------
+def _defaults_rebuild(key_data) -> None:
+    # Rebuild default values snapshot for the current key blocks.
+    try:
+        key_data.skv_key_defaults.clear()
+    except Exception:
+        return
+
+    # Reset "active keys" tracking on rescan/init.
+    try:
+        key_data.skv_active_keys.clear()
+    except Exception:
+        pass
+
+    kb_iter = getattr(key_data, "key_blocks", None) or []
+    for kb in kb_iter:
+        it = key_data.skv_key_defaults.add()
+        it.name = kb.name
+        try:
+            it.value = float(kb.value)
+        except Exception:
+            it.value = 0.0
+
+
+def _defaults_get(key_data, key_name: str):
+    # Returns default value for given key_name, or None if missing.
+    for it in getattr(key_data, "skv_key_defaults", []) or []:
+        if it.name == key_name:
+            return float(it.value)
+    return None
+
+
+def _defaults_ensure(key_data) -> None:
+    # Ensure defaults exist and match current key blocks set.
+    kb = getattr(key_data, "key_blocks", None)
+    if not kb:
+        return
+
+    defaults = getattr(key_data, "skv_key_defaults", None)
+    if defaults is None:
+        return
+
+    if len(defaults) == 0:
+        _defaults_rebuild(key_data)
+        return
+
+    if len(defaults) != len(kb):
+        _defaults_rebuild(key_data)
+        return
+
+    for i, k in enumerate(kb):
+        if defaults[i].name != k.name:
+            _defaults_rebuild(key_data)
+            return
+
+
+def _active_keys_contains(key_data, key_name: str) -> bool:
+    for it in getattr(key_data, "skv_active_keys", []) or []:
+        if it.name == key_name:
+            return True
+    return False
+
+
+def _active_keys_add_if_needed(key_data, key_name: str) -> None:
+    if not key_name or _active_keys_contains(key_data, key_name):
+        return
+    try:
+        it = key_data.skv_active_keys.add()
+        it.name = key_name
+    except Exception:
+        pass
+
+
+def _active_keys_update_from_values(obj) -> None:
+    # Add keys that differ from defaults to the active list (do not auto-remove).
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return
+    if not has_group_storage(key_data) or not is_initialized(key_data):
+        return
+
+    _defaults_ensure(key_data)
+
+    eps = 1e-6
+    for kb in key_data.key_blocks:
+        d = _defaults_get(key_data, kb.name)
+        if d is None:
+            continue
+        try:
+            if abs(float(kb.value) - float(d)) > eps:
+                _active_keys_add_if_needed(key_data, kb.name)
+        except Exception:
+            continue
+
+
+# -----------------------------
 # Automatic object sync + auto-scan
 # -----------------------------
 _SKV_SYNC_GUARD = False
@@ -64,6 +162,7 @@ def _auto_process_active_object(scene):
     """
     Sync selected object with scene selection and automatically initialize
     addon storage when a mesh object with shape keys becomes active.
+    Also captures default shape key values for 'Active Shape Keys' block.
     """
     global _SKV_SYNC_GUARD
     if _SKV_SYNC_GUARD:
@@ -113,6 +212,9 @@ def _auto_process_active_object(scene):
 
             ensure_init_setup_write(desired)
 
+        # (Re)build defaults snapshot on first run or if mismatched.
+        _defaults_ensure(key_data)
+
         tag_redraw_view3d(ctx)
     finally:
         _SKV_SYNC_GUARD = False
@@ -120,7 +222,15 @@ def _auto_process_active_object(scene):
 
 @persistent
 def _depsgraph_update_post(scene, depsgraph):
+    # 1) keep selection->addon sync + auto-init
     _auto_process_active_object(scene)
+    # 2) update active-keys list from value changes (do not remove)
+    try:
+        obj = getattr(bpy.context, "active_object", None)
+        if obj and getattr(obj, "type", None) == "MESH":
+            _active_keys_update_from_values(obj)
+    except Exception:
+        pass
 
 
 def _ensure_handler_installed():
@@ -169,7 +279,14 @@ class SKV_Props(PropertyGroup):
     keys_index: IntProperty(name="Keys Index", default=-1, min=-1)
     search: StringProperty(name="Search", default="")
     show_select: BoolProperty(name="Select", default=False, update=show_select_update)
-    groups_module_open: BoolProperty(name="Groups", default=True)
+
+    # Group workspace top-level container (collapsible)
+    groups_module_open: BoolProperty(name="Shape Keys", default=True)
+
+    # Groups and Keys blocks (collapsible)
+    groups_open: BoolProperty(name="Groups", default=True)
+    keys_open: BoolProperty(name="Keys", default=True)
+    active_keys_open: BoolProperty(name="Active Shape Keys", default=True)
 
     # Current mesh selected in the scene (synced via depsgraph handler).
     object_pick: PointerProperty(
@@ -187,9 +304,6 @@ class SKV_Props(PropertyGroup):
 
     # Status shown under object label (skip saving to .blend).
     scan_status: StringProperty(name="Scan Status", default="", options={"SKIP_SAVE"})
-
-    groups_open: BoolProperty(name="Groups", default=True)
-    keys_open: BoolProperty(name="Keys", default=True)
 
     presets_open: BoolProperty(name="Presets", default=False)
     presets_scope: EnumProperty(
@@ -219,7 +333,7 @@ class SKV_Props(PropertyGroup):
     )
 
     # Tracks last "Apply" input from Prefix/Suffix selector.
-    # Used to prefill name fields in "Create new group" / "Create new preset" dialogs.
+    # Used to prefill name fields in "Create group" / preset dialogs.
     last_affix_name: StringProperty(name="Last Affix Name", default="")
     last_affix_pending: BoolProperty(name="Last Affix Pending", default=False)
 
@@ -263,9 +377,15 @@ class SKV_PT_ShapeKeysPanel(Panel):
         if not is_initialized(key_data):
             return
 
+        _defaults_ensure(key_data)
+
         current_group = get_selected_group_name(key_data) or INIT_GROUP_NAME
 
-        # GROUP WORKSPACE
+        # Selection state for enabling action buttons
+        selected_names = set(kd_selected_set(key_data))
+        has_selected_valid = any(n and n != "Basis" for n in selected_names)
+
+        # SHAPE KEYS (workspace)
         box_ws = layout.box()
         head_ws = box_ws.row(align=True)
         icon_ws = "TRIA_DOWN" if props.groups_module_open else "TRIA_RIGHT"
@@ -273,63 +393,119 @@ class SKV_PT_ShapeKeysPanel(Panel):
         head_ws.label(text="SHAPE KEYS")
 
         if props.groups_module_open:
-            # Groups list (static open)
+            # ---- Groups (collapsible) ----
             box_groups = box_ws.box()
-            box_groups.label(text="Groups")
+            hg = box_groups.row(align=True)
+            ig = "TRIA_DOWN" if props.groups_open else "TRIA_RIGHT"
+            hg.prop(props, "groups_open", text="", emboss=False, icon=ig)
+            hg.label(text="Groups" if props.groups_open else f"Group: {current_group}")
 
-            rowg = box_groups.row()
-            rowg.template_list(
-                "SKV_UL_groups",
-                "",
-                key_data,
-                "skv_groups",
-                key_data,
-                "skv_group_index",
-                rows=5,
-            )
-            col = rowg.column(align=True)
-            col.operator("skv.group_add", icon="ADD", text="")
-            col.operator("skv.group_remove", icon="REMOVE", text="")
-            col.separator()
-            col.operator("skv.group_rename", icon="GREASEPENCIL", text="")
+            if props.groups_open:
+                rowg = box_groups.row()
+                rowg.template_list(
+                    "SKV_UL_groups",
+                    "",
+                    key_data,
+                    "skv_groups",
+                    key_data,
+                    "skv_group_index",
+                    rows=3,
+                )
+                col = rowg.column(align=True)
+                col.operator("skv.group_add", icon="ADD", text="")
+                col.operator("skv.group_remove", icon="REMOVE", text="")
+                col.separator()
+                col.operator("skv.group_rename", icon="GREASEPENCIL", text="")
 
-            # Keys list (static open)
+            # ---- Keys in group (collapsible) ----
             box_keys = box_ws.box()
-            box_keys.label(text=f"Keys in '{current_group}'")
+            hk = box_keys.row(align=True)
+            ik = "TRIA_DOWN" if props.keys_open else "TRIA_RIGHT"
+            hk.prop(props, "keys_open", text="", emboss=False, icon=ik)
+            hk.label(text=f'Keys in "{current_group}"')
 
-            group_count = count_keys_in_group(key_data, current_group)
+            if props.keys_open:
+                group_count = count_keys_in_group(key_data, current_group)
 
-            if group_count > 0:
-                row = box_keys.row(align=True)
-                row.prop(props, "search", text="", icon="VIEWZOOM")
-                row.operator("skv.search_clear", text="", icon="X")
-
-                row = box_keys.row(align=True)
-                row.prop(props, "show_select", text="Select", toggle=True)
-                if props.show_select:
-                    row.menu("SKV_MT_select_actions", text="", icon="TRIA_RIGHT")
-
-                if props.show_select:
+                if group_count > 0:
                     row = box_keys.row(align=True)
-                    row.operator("skv.select_visible", text="All").mode = "ALL"
-                    row.operator("skv.select_visible", text="Clear").mode = "NONE"
-                    row.operator("skv.select_visible", text="Invert").mode = "INVERT"
+                    row.prop(props, "search", text="", icon="VIEWZOOM")
+                    row.operator("skv.search_clear", text="", icon="X")
 
-            box_keys.template_list(
-                "SKV_UL_key_blocks",
-                "",
-                key_data,
-                "key_blocks",
-                props,
-                "keys_index",
-                rows=10,
-            )
+                    row = box_keys.row(align=True)
+                    row.prop(props, "show_select", text="Select", toggle=True)
 
-            if props.show_select and group_count > 0:
-                row = box_keys.row(align=True)
-                row.prop(props, "affix_type", text="")
-                row.prop(props, "affix_value", text="")
-                row.operator("skv.select_by_affix", text="Apply", icon="FILTER")
+                    if props.show_select:
+                        # All/Clear/Invert first
+                        row = box_keys.row(align=True)
+                        row.operator("skv.select_visible", text="All").mode = "ALL"
+                        row.operator("skv.select_visible", text="Clear").mode = "NONE"
+                        row.operator("skv.select_visible", text="Invert").mode = "INVERT"
+
+                        # Prefix/Suffix under All/Clear/Invert
+                        row = box_keys.row(align=True)
+                        row.prop(props, "affix_type", text="")
+                        row.prop(props, "affix_value", text="")
+                        row.operator("skv.select_by_affix", text="Apply", icon="FILTER")
+
+                box_keys.template_list(
+                    "SKV_UL_key_blocks",
+                    "",
+                    key_data,
+                    "key_blocks",
+                    props,
+                    "keys_index",
+                    rows=15,
+                )
+
+                # Actions moved BELOW the list; disabled if no selected shape keys
+                if props.show_select and group_count > 0:
+                    box_keys.separator()
+
+                    r1 = box_keys.row(align=True)
+                    r1.enabled = has_selected_valid
+                    r1.menu("SKV_MT_move_to_group", text="Move to group", icon="FILE_FOLDER")
+                    r1.operator("skv.create_group_from_selected", text="Create group", icon="NEWFOLDER")
+
+                    r2 = box_keys.row(align=True)
+                    r2.enabled = has_selected_valid
+                    r2.menu("SKV_MT_add_to_preset", text="Add to preset", icon="PRESET")
+                    r2.operator("skv.preset_add_from_selected", text="Create local preset", icon="PRESET")
+
+                    r3 = box_keys.row(align=True)
+                    r3.enabled = has_selected_valid
+                    r3.menu("SKV_MT_add_to_global_preset", text="Add to global preset", icon="PRESET")
+                    r3.operator(
+                        "skv.global_preset_add_from_selected",
+                        text="Create global preset",
+                        icon="PRESET",
+                    )
+
+                    r4 = box_keys.row(align=True)
+                    r4.enabled = has_selected_valid
+                    r4.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
+                    r4.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
+
+            # ---- Active Shape Keys (collapsible) ----
+            box_active = box_ws.box()
+            ha = box_active.row(align=True)
+            ia = "TRIA_DOWN" if props.active_keys_open else "TRIA_RIGHT"
+            ha.prop(props, "active_keys_open", text="", emboss=False, icon=ia)
+            ha.label(text="Active Shape Keys")
+
+            if props.active_keys_open:
+                if not getattr(key_data, "skv_active_keys", None) or len(key_data.skv_active_keys) == 0:
+                    box_active.label(text="No active shape keys.", icon="INFO")
+                else:
+                    box_active.template_list(
+                        "SKV_UL_active_keys",
+                        "",
+                        key_data,
+                        "skv_active_keys",
+                        key_data,
+                        "skv_active_keys_index",
+                        rows=6,
+                    )
 
         # PRESETS
         boxp = layout.box()
@@ -440,6 +616,13 @@ def register():
     bpy.types.Key.skv_selected = CollectionProperty(type=groups.SKV_SelectedName)
     bpy.types.Key.skv_key_groups = CollectionProperty(type=groups.SKV_KeyGroupEntry)
 
+    # Default shape key values snapshot (for Active Shape Keys)
+    bpy.types.Key.skv_key_defaults = CollectionProperty(type=groups.SKV_KeyDefaultEntry)
+
+    # Active keys tracking (persistent until user removes)
+    bpy.types.Key.skv_active_keys = CollectionProperty(type=groups.SKV_ActiveKeyEntry)
+    bpy.types.Key.skv_active_keys_index = IntProperty(name="Active Keys Index", default=-1, min=-1)
+
     bpy.types.Key.skv_presets = CollectionProperty(type=presets.SKV_Preset)
     bpy.types.Key.skv_preset_index = IntProperty(name="Preset Index", default=0, min=0)
 
@@ -456,6 +639,14 @@ def unregister():
 
     del bpy.types.Key.skv_preset_index
     del bpy.types.Key.skv_presets
+
+    if hasattr(bpy.types.Key, "skv_active_keys_index"):
+        del bpy.types.Key.skv_active_keys_index
+    if hasattr(bpy.types.Key, "skv_active_keys"):
+        del bpy.types.Key.skv_active_keys
+    if hasattr(bpy.types.Key, "skv_key_defaults"):
+        del bpy.types.Key.skv_key_defaults
+
     del bpy.types.Key.skv_key_groups
     del bpy.types.Key.skv_selected
     del bpy.types.Key.skv_groups

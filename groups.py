@@ -1,9 +1,11 @@
+# groups.py
 import bpy
 from bpy.types import Operator, PropertyGroup, UIList, Menu
 from bpy.props import (
     BoolProperty,
     IntProperty,
     StringProperty,
+    FloatProperty,
     CollectionProperty,
 )
 
@@ -44,6 +46,15 @@ class SKV_SelectedName(PropertyGroup):
 class SKV_KeyGroupEntry(PropertyGroup):
     name: StringProperty(name="Key Name", default="")
     group: StringProperty(name="Group", default=INIT_GROUP_NAME)
+
+
+class SKV_KeyDefaultEntry(PropertyGroup):
+    name: StringProperty(name="Key Name", default="")
+    value: FloatProperty(name="Default Value", default=0.0)
+
+
+class SKV_ActiveKeyEntry(PropertyGroup):
+    name: StringProperty(name="Key Name", default="")
 
 
 # -----------------------------
@@ -124,6 +135,33 @@ class SKV_UL_key_blocks(UIList):
         opv.key_name = kb.name
 
 
+class SKV_UL_active_keys(UIList):
+    bl_idname = "SKV_UL_active_keys"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        # data is Key datablock, item is SKV_ActiveKeyEntry
+        key_data = data
+        entry = item
+        kname = entry.name
+
+        row = layout.row(align=True)
+
+        kb = None
+        try:
+            kb = key_data.key_blocks.get(kname) if kname else None
+        except Exception:
+            kb = None
+
+        if kb:
+            row.prop(kb, "value", text=kname, slider=True)
+        else:
+            row.label(text=kname or "Invalid", icon="ERROR")
+
+        # Make the remove button more visible
+        op = row.operator("skv.active_key_remove", text="", icon="REMOVE", emboss=False)
+        op.key_name = kname
+
+
 # -----------------------------
 # Menus
 # -----------------------------
@@ -150,32 +188,79 @@ class SKV_MT_SelectActions(Menu):
 
     def draw(self, context):
         layout = self.layout
+        layout.label(text="Not used (actions are displayed inline).")
 
-        # Section: grouping
-        layout.menu("SKV_MT_move_to_group", text="Move to group", icon="FILE_FOLDER")
-        layout.operator("skv.create_group_from_selected", text="Create new group", icon="NEWFOLDER")
 
-        layout.separator()
+# -----------------------------
+# Operators
+# -----------------------------
+class SKV_OT_ActiveKeyRemove(Operator):
+    bl_idname = "skv.active_key_remove"
+    bl_label = "Remove From Active"
+    bl_options = {"REGISTER", "UNDO"}
 
-        # Section: local presets
-        layout.menu("SKV_MT_add_to_preset", text="Add to preset", icon="PRESET")
-        layout.operator("skv.preset_add_from_selected", text="Create new preset", icon="PRESET")
+    key_name: StringProperty(name="Key Name", default="")
 
-        layout.separator()
+    @classmethod
+    def poll(cls, context):
+        obj = get_active_object(context)
+        key_data = get_shape_key_data(obj) if obj else None
+        return bool(key_data and hasattr(key_data, "skv_active_keys") and hasattr(key_data, "skv_key_defaults"))
 
-        # Section: global presets
-        layout.menu("SKV_MT_add_to_global_preset", text="Add to global preset", icon="PRESET")
-        layout.operator("skv.global_preset_add_from_selected", text="Create new global preset", icon="PRESET")
+    def execute(self, context):
+        obj = get_active_object(context)
+        key_data = get_shape_key_data(obj) if obj else None
+        if not obj or not key_data:
+            return {"CANCELLED"}
 
-        layout.separator()
+        name = (self.key_name or "").strip()
+        if not name:
+            return {"CANCELLED"}
 
-        # Section: transfer
-        layout.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
+        kb = None
+        try:
+            kb = key_data.key_blocks.get(name)
+        except Exception:
+            kb = None
 
-        layout.separator()
+        # 1) Remove from active list
+        try:
+            for i, it in enumerate(list(key_data.skv_active_keys)):
+                if it.name == name:
+                    key_data.skv_active_keys.remove(i)
+                    break
+        except Exception:
+            pass
 
-        # Section: values
-        layout.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
+        # 2) Update default value to current value so it won't re-appear
+        #    unless changed again in the future.
+        if kb is not None:
+            cur_val = 0.0
+            try:
+                cur_val = float(kb.value)
+            except Exception:
+                cur_val = 0.0
+
+            updated = False
+            try:
+                for it in key_data.skv_key_defaults:
+                    if it.name == name:
+                        it.value = cur_val
+                        updated = True
+                        break
+            except Exception:
+                updated = False
+
+            if not updated:
+                try:
+                    it = key_data.skv_key_defaults.add()
+                    it.name = name
+                    it.value = cur_val
+                except Exception:
+                    pass
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
 
 
 class SKV_OT_ShapeKeyToggleVisibility(Operator):
@@ -206,9 +291,6 @@ class SKV_OT_ShapeKeyToggleVisibility(Operator):
         return {"FINISHED"}
 
 
-# -----------------------------
-# Operators
-# -----------------------------
 class SKV_OT_KeyToggleSelect(Operator):
     bl_idname = "skv.key_toggle_select"
     bl_label = "Toggle Shape Key Selection"
@@ -602,11 +684,9 @@ class SKV_OT_CreateGroupFromSelected(Operator):
     name: StringProperty(name="Group Name", default="New Group")
 
     def invoke(self, context, event):
-        # Prefill from last applied affix, only if it is pending.
         props = getattr(context.scene, "skv_props", None)
         if props and props.last_affix_pending and props.last_affix_name.strip():
             self.name = props.last_affix_name.strip()
-            # One-shot: clear pending so other creates revert to defaults unless Apply is used again.
             props.last_affix_pending = False
         else:
             self.name = "New Group"
@@ -651,7 +731,6 @@ class SKV_OT_CreateGroupFromSelected(Operator):
         g = key_data.skv_groups.add()
         g.name = new_name
 
-        # Keep current group selection
         if 0 <= prev_idx < len(key_data.skv_groups):
             key_data.skv_group_index = prev_idx
 
@@ -662,7 +741,6 @@ class SKV_OT_CreateGroupFromSelected(Operator):
                 moved += 1
 
         if moved == 0:
-            # Rollback group if nothing moved (should not happen)
             for i, gg in enumerate(key_data.skv_groups):
                 if gg.name == new_name:
                     key_data.skv_groups.remove(i)
@@ -685,10 +763,8 @@ class SKV_OT_TransferTo(Operator):
         if not obj:
             return {"CANCELLED"}
 
-        # Store source name on Scene for target polling (exclude current object).
         context.scene.skv_transfer_source_name = obj.name
 
-        # Reset target if it matches source or is invalid.
         tgt = getattr(context.scene, "skv_transfer_target", None)
         if not tgt or getattr(tgt, "type", None) != "MESH" or tgt.name == obj.name:
             context.scene.skv_transfer_target = None
@@ -707,7 +783,6 @@ class SKV_OT_TransferTo(Operator):
         key_data = get_shape_key_data(obj)
         if not key_data or not getattr(key_data, "key_blocks", None):
             return False
-        # Require at least one selected shape key (excluding Basis).
         selected = list(kd_selected_set(key_data))
         return any(n != "Basis" for n in selected)
 
@@ -740,10 +815,8 @@ class SKV_OT_TransferTo(Operator):
             self.report({"WARNING"}, "Nothing transferred")
             return {"CANCELLED"}
 
-        # Clear selection UI after successful transfer (on source).
         clear_selection_ui(context, key_data)
 
-        # Switch scene selection/focus to target (equivalent to clicking target).
         view_layer = context.view_layer
         try:
             for ob in list(view_layer.objects):
@@ -767,10 +840,15 @@ CLASSES = (
     SKV_Group,
     SKV_SelectedName,
     SKV_KeyGroupEntry,
+    SKV_KeyDefaultEntry,
+    SKV_ActiveKeyEntry,
     SKV_UL_Groups,
     SKV_UL_key_blocks,
+    SKV_UL_active_keys,
     SKV_MT_MoveToGroup,
     SKV_MT_SelectActions,
+    SKV_OT_ActiveKeyRemove,
+    SKV_OT_ShapeKeyToggleVisibility,
     SKV_OT_KeyToggleSelect,
     SKV_OT_SelectVisible,
     SKV_OT_SelectByAffix,
@@ -780,6 +858,5 @@ CLASSES = (
     SKV_OT_GroupRemove,
     SKV_OT_GroupRename,
     SKV_OT_CreateGroupFromSelected,
-    SKV_OT_ShapeKeyToggleVisibility,
     SKV_OT_TransferTo,
 )
