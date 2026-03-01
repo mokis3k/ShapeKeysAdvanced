@@ -28,6 +28,7 @@ from .common import (
     kd_clear_selected,
     count_keys_in_group,
     ensure_init_setup_write,
+    InternalValueChangeGuard,
 )
 
 
@@ -115,12 +116,10 @@ class SKV_UL_key_blocks(UIList):
         for kb in getattr(key_data, propname):
             ok = True
 
-            # Filter by group membership
             if group_name:
                 if kd_get_group(key_data, kb.name) != group_name:
                     ok = False
 
-            # Filter by search tokens
             if ok and tokens:
                 name_l = kb.name.lower()
                 for t in tokens:
@@ -139,21 +138,17 @@ class SKV_UL_key_blocks(UIList):
 
         row = layout.row(align=True)
 
-        # Selection checkbox (only in Select mode)
         if props.show_select:
             icon_id = "CHECKBOX_HLT" if kd_is_selected(key_data, kb.name) else "CHECKBOX_DEHLT"
             op = row.operator("skv.key_toggle_select", text="", icon=icon_id, emboss=False)
             op.key_index = index
 
-        # Shape key slider / name
         row.prop(kb, "value", text=kb.name, slider=True)
 
-        # Visibility toggle (mute)
         vis_icon = "HIDE_ON" if kb.mute else "HIDE_OFF"
         opv = row.operator("skv.shape_key_toggle_visibility", text="", icon=vis_icon, emboss=False)
         opv.key_name = kb.name
 
-        # Auto keyframe toggle
         entry = _autokf_get_entry(key_data, kb.name, create=False)
         kf_enabled = bool(entry.enabled) if entry else False
         kf_icon = "KEYFRAME_HLT" if kf_enabled else "KEYFRAME"
@@ -165,7 +160,6 @@ class SKV_UL_active_keys(UIList):
     bl_idname = "SKV_UL_active_keys"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        # data is Key datablock, item is SKV_ActiveKeyEntry
         key_data = data
         entry = item
         kname = entry.name
@@ -183,7 +177,6 @@ class SKV_UL_active_keys(UIList):
         else:
             row.label(text=kname or "Invalid", icon="ERROR")
 
-        # Make the remove button more visible
         op = row.operator("skv.active_key_remove", text="", icon="REMOVE", emboss=False)
         op.key_name = kname
 
@@ -218,7 +211,7 @@ class SKV_MT_SelectActions(Menu):
 
 
 # -----------------------------
-# Operators
+# Operators (required by CLASSES)
 # -----------------------------
 class SKV_OT_ActiveKeyRemove(Operator):
     bl_idname = "skv.active_key_remove"
@@ -243,47 +236,40 @@ class SKV_OT_ActiveKeyRemove(Operator):
         if not name:
             return {"CANCELLED"}
 
-        kb = None
+        try:
+            i = 0
+            while i < len(key_data.skv_active_keys):
+                if key_data.skv_active_keys[i].name == name:
+                    key_data.skv_active_keys.remove(i)
+                    break
+                i += 1
+        except Exception:
+            pass
+
         try:
             kb = key_data.key_blocks.get(name)
         except Exception:
             kb = None
 
-        # 1) Remove from active list
-        try:
-            for i, it in enumerate(list(key_data.skv_active_keys)):
-                if it.name == name:
-                    key_data.skv_active_keys.remove(i)
-                    break
-        except Exception:
-            pass
-
-        # 2) Update default value to current value so it won't re-appear
-        #    unless changed again in the future.
-        if kb is not None:
-            cur_val = 0.0
+        if kb is not None and hasattr(key_data, "skv_key_defaults"):
             try:
                 cur_val = float(kb.value)
             except Exception:
                 cur_val = 0.0
 
-            updated = False
             try:
+                updated = False
                 for it in key_data.skv_key_defaults:
                     if it.name == name:
                         it.value = cur_val
                         updated = True
                         break
-            except Exception:
-                updated = False
-
-            if not updated:
-                try:
+                if not updated:
                     it = key_data.skv_key_defaults.add()
                     it.name = name
                     it.value = cur_val
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         tag_redraw_view3d(context)
         return {"FINISHED"}
@@ -294,22 +280,16 @@ class SKV_OT_ShapeKeyToggleVisibility(Operator):
     bl_label = "Toggle Shape Key Visibility"
     bl_options = {"REGISTER", "UNDO"}
 
-    key_name: StringProperty(name="Shape Key Name", default="")
-
-    @classmethod
-    def poll(cls, context):
-        obj = get_active_object(context)
-        return bool(obj and get_shape_key_data(obj))
+    key_name: StringProperty(name="Key Name", default="")
 
     def execute(self, context):
         obj = get_active_object(context)
         key_data = get_shape_key_data(obj) if obj else None
-        if not obj or not key_data:
+        if not obj or not key_data or not getattr(key_data, "key_blocks", None):
             return {"CANCELLED"}
 
         kb = key_data.key_blocks.get(self.key_name)
         if not kb:
-            self.report({"WARNING"}, "Shape Key not found")
             return {"CANCELLED"}
 
         kb.mute = not kb.mute
@@ -322,22 +302,14 @@ class SKV_OT_AutoKeyframeToggle(Operator):
     bl_label = "Toggle Auto Keyframe"
     bl_options = {"REGISTER", "UNDO"}
 
-    key_name: StringProperty(name="Shape Key Name", default="")
-
-    @classmethod
-    def poll(cls, context):
-        obj = get_active_object(context)
-        key_data = get_shape_key_data(obj) if obj else None
-        return bool(key_data and getattr(key_data, "key_blocks", None))
+    key_name: StringProperty(name="Key Name", default="")
 
     def execute(self, context):
         obj = get_active_object(context)
         key_data = get_shape_key_data(obj) if obj else None
         if not obj or not key_data or not getattr(key_data, "key_blocks", None):
             return {"CANCELLED"}
-
         if getattr(key_data, "library", None) is not None:
-            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
             return {"CANCELLED"}
 
         name = (self.key_name or "").strip()
@@ -346,23 +318,18 @@ class SKV_OT_AutoKeyframeToggle(Operator):
 
         kb = key_data.key_blocks.get(name)
         if not kb:
-            self.report({"WARNING"}, "Shape Key not found")
             return {"CANCELLED"}
 
         entry = _autokf_get_entry(key_data, name, create=True)
         entry.enabled = not bool(entry.enabled)
 
         frame = int(context.scene.frame_current)
-        try:
-            entry.last_frame = frame
-        except Exception:
-            pass
+        entry.last_frame = frame
         try:
             entry.last_value = float(kb.value)
         except Exception:
             entry.last_value = 0.0
 
-        # When enabling, insert an initial keyframe at current frame.
         if entry.enabled:
             try:
                 key_data.keyframe_insert(data_path=f'key_blocks["{kb.name}"].value', frame=frame)
@@ -375,21 +342,23 @@ class SKV_OT_AutoKeyframeToggle(Operator):
 
 class SKV_OT_KeyToggleSelect(Operator):
     bl_idname = "skv.key_toggle_select"
-    bl_label = "Toggle Shape Key Selection"
+    bl_label = "Toggle Select"
     bl_options = {"REGISTER", "UNDO"}
 
-    key_index: IntProperty()
+    key_index: IntProperty(name="Key Index", default=-1)
 
     def execute(self, context):
         obj = get_active_object(context)
         key_data = get_shape_key_data(obj) if obj else None
-        if not key_data or not key_data.key_blocks:
+        if not obj or not key_data or not getattr(key_data, "key_blocks", None):
             return {"CANCELLED"}
 
-        if 0 <= self.key_index < len(key_data.key_blocks):
-            kb = key_data.key_blocks[self.key_index]
-            kd_set_selected(key_data, kb.name, not kd_is_selected(key_data, kb.name))
+        idx = int(self.key_index)
+        if idx < 0 or idx >= len(key_data.key_blocks):
+            return {"CANCELLED"}
 
+        kb = key_data.key_blocks[idx]
+        kd_set_selected(key_data, kb.name, not kd_is_selected(key_data, kb.name))
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
@@ -412,25 +381,25 @@ class SKV_OT_SelectVisible(Operator):
     def execute(self, context):
         obj = get_active_object(context)
         key_data = get_shape_key_data(obj) if obj else None
-        if not key_data or not key_data.key_blocks:
+        if not obj or not key_data or not getattr(key_data, "key_blocks", None):
             return {"CANCELLED"}
 
+        group_name = get_selected_group_name(key_data)
         props = context.scene.skv_props
-        selected_group = get_selected_group_name(key_data)
-        search = props.search.strip().lower()
+        search = (props.search or "").strip().lower()
 
-        for kb in key_data.key_blocks:
-            if kd_get_group(key_data, kb.name) != selected_group:
-                continue
-            if search and search not in kb.name.lower():
-                continue
-
-            if self.mode == "ALL":
-                kd_set_selected(key_data, kb.name, True)
-            elif self.mode == "NONE":
-                kd_set_selected(key_data, kb.name, False)
-            else:
-                kd_set_selected(key_data, kb.name, not kd_is_selected(key_data, kb.name))
+        if self.mode == "NONE":
+            kd_clear_selected(key_data)
+        else:
+            for kb in key_data.key_blocks:
+                if kd_get_group(key_data, kb.name) != group_name:
+                    continue
+                if search and search not in kb.name.lower():
+                    continue
+                if self.mode == "ALL":
+                    kd_set_selected(key_data, kb.name, True)
+                else:
+                    kd_set_selected(key_data, kb.name, not kd_is_selected(key_data, kb.name))
 
         tag_redraw_view3d(context)
         return {"FINISHED"}
@@ -444,56 +413,30 @@ class SKV_OT_SelectByAffix(Operator):
     def execute(self, context):
         obj = get_active_object(context)
         key_data = get_shape_key_data(obj) if obj else None
-        if not key_data or not key_data.key_blocks:
-            return {"CANCELLED"}
-
-        if getattr(key_data, "library", None) is not None:
-            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
-            return {"CANCELLED"}
-
-        if not is_initialized(key_data):
-            self.report({"INFO"}, "Not initialized.")
+        if not obj or not key_data or not getattr(key_data, "key_blocks", None):
             return {"CANCELLED"}
 
         props = context.scene.skv_props
-        selected_group = get_selected_group_name(key_data)
+        group_name = get_selected_group_name(key_data)
 
-        raw_affix = props.affix_value
-        tokens = parse_tokens(raw_affix)
+        tokens = parse_tokens(props.affix_value)
         if not tokens:
-            self.report({"INFO"}, "No prefix/suffix provided.")
             return {"CANCELLED"}
 
         kd_clear_selected(key_data)
 
         if props.affix_type == "PREFIX":
-
-            def match(name: str) -> bool:
-                return any(name.startswith(t) for t in tokens)
-
+            def match(n: str) -> bool:
+                return any(n.startswith(t) for t in tokens)
         else:
+            def match(n: str) -> bool:
+                return any(n.endswith(t) for t in tokens)
 
-            def match(name: str) -> bool:
-                return any(name.endswith(t) for t in tokens)
-
-        selected_any = 0
         for kb in key_data.key_blocks:
-            if kd_get_group(key_data, kb.name) != selected_group:
+            if kd_get_group(key_data, kb.name) != group_name:
                 continue
             if match(kb.name):
                 kd_set_selected(key_data, kb.name, True)
-                selected_any += 1
-
-        if selected_any == 0:
-            self.report({"INFO"}, "No shape keys matched.")
-            return {"CANCELLED"}
-
-        # Track the last applied affix and mark it as pending for name prefills.
-        props.last_affix_name = raw_affix.strip()
-        props.last_affix_pending = True
-
-        # Clear input for next usage.
-        props.affix_value = ""
 
         tag_redraw_view3d(context)
         return {"FINISHED"}
@@ -524,26 +467,92 @@ class SKV_OT_MoveSelectedToGroup(Operator):
 
 class SKV_OT_ResetGroupValues(Operator):
     bl_idname = "skv.reset_group_values"
-    bl_label = "Zero Selected Values"
+    bl_label = "Zero Values (Selected)"
+    bl_description = "Set value=0 only for selected shape keys in the current group"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         obj = get_active_object(context)
-        key_data = get_shape_key_data(obj) if obj else None
-        if not obj or not key_data:
+        if not obj:
             return {"CANCELLED"}
 
+        key_data = get_shape_key_data(obj)
+        if not key_data or not key_data.key_blocks:
+            return {"CANCELLED"}
+
+        if getattr(key_data, "library", None) is not None:
+            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
+            return {"CANCELLED"}
+
+        if not is_initialized(key_data):
+            self.report({"INFO"}, "Not initialized.")
+            return {"CANCELLED"}
+
+        ensure_init_setup_write(obj)
+
+        group_name = get_selected_group_name(key_data)
         selected = kd_selected_set(key_data)
-        for n in selected:
-            if not n or n == "Basis":
-                continue
-            kb = key_data.key_blocks.get(n)
-            if kb:
+
+        if not selected:
+            self.report({"INFO"}, "No selected shape keys.")
+            return {"CANCELLED"}
+
+        preexisting_active = set()
+        try:
+            if hasattr(key_data, "skv_active_keys"):
+                preexisting_active = {it.name for it in key_data.skv_active_keys if it.name}
+        except Exception:
+            preexisting_active = set()
+
+        changed = 0
+        with InternalValueChangeGuard():
+            for kb in key_data.key_blocks:
+                if kb.name not in selected:
+                    continue
+                if kd_get_group(key_data, kb.name) != group_name:
+                    continue
+
                 try:
                     kb.value = 0.0
                 except Exception:
+                    continue
+
+                # Sync defaults snapshot to the new value so diff-based detector won't add it later.
+                try:
+                    if hasattr(key_data, "skv_key_defaults"):
+                        updated = False
+                        for d in key_data.skv_key_defaults:
+                            if d.name == kb.name:
+                                d.value = 0.0
+                                updated = True
+                                break
+                        if not updated:
+                            d = key_data.skv_key_defaults.add()
+                            d.name = kb.name
+                            d.value = 0.0
+                except Exception:
                     pass
 
+                # Do not remove keys that were already in Active Shape Keys before the operation.
+                if kb.name not in preexisting_active:
+                    try:
+                        if hasattr(key_data, "skv_active_keys"):
+                            i = 0
+                            while i < len(key_data.skv_active_keys):
+                                if key_data.skv_active_keys[i].name == kb.name:
+                                    key_data.skv_active_keys.remove(i)
+                                else:
+                                    i += 1
+                    except Exception:
+                        pass
+
+                changed += 1
+
+        if changed == 0:
+            self.report({"INFO"}, "No keys were reset.")
+            return {"CANCELLED"}
+
+        kd_clear_selected(key_data)
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
@@ -594,7 +603,6 @@ class SKV_OT_GroupAdd(Operator):
         g = key_data.skv_groups.add()
         g.name = new_name
 
-        # Keep current group
         if 0 <= prev_idx < len(key_data.skv_groups):
             key_data.skv_group_index = prev_idx
 

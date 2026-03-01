@@ -6,6 +6,34 @@ INIT_GROUP_NAME = "Main"
 # Prevent recursion when preset slider writes to key values
 _PRESET_APPLY_GUARD = False
 
+# Internal guard for programmatic shape key value changes (addon operators).
+# Used to prevent "Active Shape Keys" being polluted by scripted value updates.
+_SKV_INTERNAL_VALUE_CHANGE_DEPTH = 0
+
+
+def internal_value_change_begin() -> None:
+    global _SKV_INTERNAL_VALUE_CHANGE_DEPTH
+    _SKV_INTERNAL_VALUE_CHANGE_DEPTH += 1
+
+
+def internal_value_change_end() -> None:
+    global _SKV_INTERNAL_VALUE_CHANGE_DEPTH
+    _SKV_INTERNAL_VALUE_CHANGE_DEPTH = max(0, _SKV_INTERNAL_VALUE_CHANGE_DEPTH - 1)
+
+
+def is_internal_value_change() -> bool:
+    return _SKV_INTERNAL_VALUE_CHANGE_DEPTH > 0
+
+
+class InternalValueChangeGuard:
+    def __enter__(self):
+        internal_value_change_begin()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        internal_value_change_end()
+        return False
+
 
 # Utilities
 def get_active_object(context):
@@ -42,12 +70,7 @@ def group_names(key_data):
 
 
 def is_initialized(key_data) -> bool:
-    """Return True when addon storage exists and default group is present.
-
-    Minimal safety policy:
-    - Only INIT_GROUP_NAME is considered a valid default group.
-    - Legacy group name "Init" is not treated as initialized; it is cleaned up on Scan.
-    """
+    """Return True when addon storage exists and default group is present."""
     if not has_group_storage(key_data):
         return False
     if not getattr(key_data, "skv_groups", None):
@@ -55,20 +78,7 @@ def is_initialized(key_data) -> bool:
     return any(g.name == INIT_GROUP_NAME for g in key_data.skv_groups)
 
 
-
 def cleanup_legacy_init_group(key_data) -> None:
-    """Minimal in-memory cleanup for legacy default group name "Init".
-
-    This addon instance uses only INIT_GROUP_NAME. If a legacy "Init" group is present
-    (e.g. after hot-reloading the addon without restarting Blender), we normalize it:
-
-    - If INIT_GROUP_NAME exists: remove all "Init" groups and remap any references.
-    - Else: rename the first "Init" to INIT_GROUP_NAME and remove duplicates.
-    - Remove legacy per-key ID prop "skv_group" (no longer used).
-
-    This function is intentionally NOT called during UI drawing to keep behavior simple.
-    It is called from ensure_init_setup_write() (Scan).
-    """
     if not has_group_storage(key_data) or not getattr(key_data, "skv_groups", None):
         return
     # Do not modify linked data.
@@ -77,7 +87,6 @@ def cleanup_legacy_init_group(key_data) -> None:
 
     init_indices = [i for i, g in enumerate(key_data.skv_groups) if g.name == "Init"]
     if not init_indices:
-        # Still remove legacy per-key ID props, if any.
         if getattr(key_data, "key_blocks", None):
             for kb in key_data.key_blocks:
                 try:
@@ -96,14 +105,12 @@ def cleanup_legacy_init_group(key_data) -> None:
                 it.group = INIT_GROUP_NAME
 
     if main_indices:
-        # Default group already exists; drop all legacy groups.
         for i in reversed(init_indices):
             try:
                 key_data.skv_groups.remove(i)
             except Exception:
                 pass
     else:
-        # Rename the first legacy group to INIT_GROUP_NAME and remove duplicates.
         try:
             key_data.skv_groups[init_indices[0]].name = INIT_GROUP_NAME
         except Exception:
@@ -114,14 +121,12 @@ def cleanup_legacy_init_group(key_data) -> None:
             except Exception:
                 pass
 
-    # Ensure active index is valid after removals/rename.
     try:
         if key_data.skv_group_index < 0 or key_data.skv_group_index >= len(key_data.skv_groups):
             key_data.skv_group_index = 0
     except Exception:
         pass
 
-    # Remove legacy per-key ID prop (no longer used).
     if getattr(key_data, "key_blocks", None):
         for kb in key_data.key_blocks:
             try:
@@ -158,8 +163,7 @@ def tag_redraw_view3d(context):
             area.tag_redraw()
 
 
-def parse_tokens(text: str) -> list[str]:
-    # Split by comma/semicolon, trim, drop empties
+def parse_tokens(text: str):
     if not text:
         return []
     parts = re.split(r"[;,]+", text)
@@ -172,7 +176,6 @@ def parse_tokens(text: str) -> list[str]:
 
 
 def clear_selection_ui(context, key_data):
-    # Clear selected keys, disable Select mode
     if key_data and hasattr(key_data, "skv_selected"):
         key_data.skv_selected.clear()
     if hasattr(context, "scene") and hasattr(context.scene, "skv_props"):
@@ -180,7 +183,6 @@ def clear_selection_ui(context, key_data):
 
 
 def show_select_update(self, context):
-    # Clear selection when toggling Select mode
     obj = get_active_object(context)
     key_data = get_shape_key_data(obj) if obj else None
     if key_data and hasattr(key_data, "skv_selected"):
@@ -188,7 +190,6 @@ def show_select_update(self, context):
     tag_redraw_view3d(context)
 
 
-# Legacy (old versions) group storage on KeyBlock ID props
 def kd_get_group(key_data, kb_name: str) -> str:
     if not key_data or not hasattr(key_data, "skv_key_groups"):
         return INIT_GROUP_NAME
@@ -217,7 +218,7 @@ def kd_set_group(key_data, kb_name: str, group_name: str) -> None:
     it.group = group_name
 
 
-def kd_prune_group_map(key_data, valid_names: set[str]) -> None:
+def kd_prune_group_map(key_data, valid_names) -> None:
     if not key_data or not hasattr(key_data, "skv_key_groups"):
         return
     i = 0
@@ -228,8 +229,7 @@ def kd_prune_group_map(key_data, valid_names: set[str]) -> None:
             i += 1
 
 
-# Multi-select storage on Key datablock (name list)
-def kd_selected_set(key_data) -> set[str]:
+def kd_selected_set(key_data):
     if not key_data or not hasattr(key_data, "skv_selected"):
         return set()
     return {it.name for it in key_data.skv_selected if it.name}
@@ -266,7 +266,6 @@ def kd_clear_selected(key_data) -> None:
     key_data.skv_selected.clear()
 
 
-# Counts
 def count_keys_in_group(key_data, group_name: str) -> int:
     if not key_data or not getattr(key_data, "key_blocks", None):
         return 0
@@ -291,7 +290,6 @@ def count_selected_in_group(key_data, group_name: str, search: str) -> int:
     return c
 
 
-# Init / scan sync (Operators only)
 def ensure_init_setup_write(obj):
     key_data = get_shape_key_data(obj)
     if not key_data or not getattr(key_data, "key_blocks", None):
@@ -301,7 +299,6 @@ def ensure_init_setup_write(obj):
     if getattr(key_data, "library", None) is not None:
         return
 
-    # Minimal safety: normalize any in-memory legacy "Init" group to INIT_GROUP_NAME.
     cleanup_legacy_init_group(key_data)
 
     names = group_names(key_data)
@@ -310,30 +307,35 @@ def ensure_init_setup_write(obj):
         g.name = INIT_GROUP_NAME
         names = group_names(key_data)
 
-    # Keep active index valid.
     try:
         if key_data.skv_group_index < 0 or key_data.skv_group_index >= len(key_data.skv_groups):
             key_data.skv_group_index = 0
     except Exception:
         pass
 
-    # Prune mapping entries that point to missing KeyBlocks.
     valid_kb_names = {kb.name for kb in key_data.key_blocks}
     kd_prune_group_map(key_data, valid_kb_names)
 
-    # Ensure every key belongs to an existing group; default to INIT_GROUP_NAME.
     for kb in key_data.key_blocks:
         cur = kd_get_group(key_data, kb.name)
         if cur not in names:
             kd_set_group(key_data, kb.name, INIT_GROUP_NAME)
 
-    # Legacy per-key ID prop is no longer used; remove if present.
     for kb in key_data.key_blocks:
         try:
             if "skv_group" in kb:
                 del kb["skv_group"]
         except Exception:
             pass
+
+
+def get_active_preset(key_data):
+    if not key_data or not hasattr(key_data, "skv_presets") or not hasattr(key_data, "skv_preset_index"):
+        return None
+    idx = int(key_data.skv_preset_index)
+    if 0 <= idx < len(key_data.skv_presets):
+        return key_data.skv_presets[idx]
+    return None
 
 
 def _is_basis_name(key_data, name: str) -> bool:
@@ -364,16 +366,53 @@ def preset_apply(preset, context) -> None:
     try:
         kb_map = key_data.key_blocks
         factor = float(preset.value)
-        for it in preset.items:
-            if not it.name:
-                continue
-            kb = kb_map.get(it.name)
-            if not kb:
-                continue
-            try:
-                kb.value = factor * float(it.max_value)
-            except Exception:
-                pass
+
+        # Prevent "Active Shape Keys" pollution by preset-driven value changes.
+        with InternalValueChangeGuard():
+            for it in preset.items:
+                if not it.name:
+                    continue
+                kb = kb_map.get(it.name)
+                if not kb:
+                    continue
+
+                try:
+                    new_val = factor * float(it.max_value)
+                except Exception:
+                    continue
+
+                try:
+                    kb.value = new_val
+                except Exception:
+                    continue
+
+                # Sync defaults snapshot to new value so diff-based detector won't add it later.
+                try:
+                    updated = False
+                    if hasattr(key_data, "skv_key_defaults"):
+                        for d in key_data.skv_key_defaults:
+                            if d.name == kb.name:
+                                d.value = float(new_val)
+                                updated = True
+                                break
+                        if not updated:
+                            d = key_data.skv_key_defaults.add()
+                            d.name = kb.name
+                            d.value = float(new_val)
+                except Exception:
+                    pass
+
+                # Remove from active list if present.
+                try:
+                    if hasattr(key_data, "skv_active_keys"):
+                        i = 0
+                        while i < len(key_data.skv_active_keys):
+                            if key_data.skv_active_keys[i].name == kb.name:
+                                key_data.skv_active_keys.remove(i)
+                            else:
+                                i += 1
+                except Exception:
+                    pass
     finally:
         _PRESET_APPLY_GUARD = False
 
@@ -382,12 +421,3 @@ def preset_apply(preset, context) -> None:
 
 def preset_value_update(self, context):
     preset_apply(self, context)
-
-
-def get_active_preset(key_data):
-    if not key_data or not hasattr(key_data, "skv_presets") or not hasattr(key_data, "skv_preset_index"):
-        return None
-    idx = int(key_data.skv_preset_index)
-    if 0 <= idx < len(key_data.skv_presets):
-        return key_data.skv_presets[idx]
-    return None

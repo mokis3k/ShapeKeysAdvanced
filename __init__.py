@@ -29,18 +29,15 @@ from .common import (
     get_selected_group_name,
     count_keys_in_group,
     tag_redraw_view3d,
-    get_active_preset,
     INIT_GROUP_NAME,
     kd_selected_set,
+    is_internal_value_change,
 )
 from . import groups
 from . import presets
 from . import meshDataTransfer
 
 
-# -----------------------------
-# Poll helpers
-# -----------------------------
 def _poll_mesh_object(self, obj):
     # Accept only mesh objects.
     return bool(obj) and getattr(obj, "type", None) == "MESH"
@@ -126,16 +123,57 @@ def _active_keys_add_if_needed(key_data, key_name: str) -> None:
         it = key_data.skv_active_keys.add()
         it.name = key_name
     except Exception:
+        return
+
+    # Auto-expand Active Shape Keys block when a new active key is detected.
+    try:
+        scn = bpy.context.scene
+        props = getattr(scn, "skv_props", None)
+        if props:
+            props.active_keys_open = True
+    except Exception:
         pass
+
+
+_SKV_ACTIVE_KEYS_LAST_FRAME = None
 
 
 def _active_keys_update_from_values(obj) -> None:
     # Add keys that differ from defaults to the active list (do not auto-remove).
+    # Only treat manual edits as "active":
+    # - ignore updates during animation playback and frame changes (evaluation/scrub)
+    # - ignore programmatic changes made by addon operators (guarded)
+    global _SKV_ACTIVE_KEYS_LAST_FRAME
+
     key_data = get_shape_key_data(obj)
     if not key_data or not getattr(key_data, "key_blocks", None):
         return
     if not has_group_storage(key_data) or not is_initialized(key_data):
         return
+
+    if is_internal_value_change():
+        return
+
+    # Ignore playback-driven changes.
+    try:
+        scr = bpy.context.screen
+        if scr and getattr(scr, "is_animation_playing", False):
+            return
+    except Exception:
+        pass
+
+    # Ignore changes caused by frame evaluation (scrub / frame step).
+    try:
+        cur_frame = int(bpy.context.scene.frame_current)
+    except Exception:
+        cur_frame = None
+
+    if cur_frame is not None:
+        if _SKV_ACTIVE_KEYS_LAST_FRAME is None:
+            _SKV_ACTIVE_KEYS_LAST_FRAME = cur_frame
+        elif cur_frame != _SKV_ACTIVE_KEYS_LAST_FRAME:
+            _SKV_ACTIVE_KEYS_LAST_FRAME = cur_frame
+            return
 
     _defaults_ensure(key_data)
 
@@ -149,63 +187,6 @@ def _active_keys_update_from_values(obj) -> None:
                 _active_keys_add_if_needed(key_data, kb.name)
         except Exception:
             continue
-
-
-def _auto_keyframe_update(scene, obj) -> None:
-    """Auto-insert keyframes for shape key values.
-
-    Uses per-key entries stored on Key datablock (key_data.skv_auto_keyframes).
-
-    Policy:
-      - If frame changed since last check: update tracking state, do not insert.
-      - If value changed while staying on the same frame: insert a keyframe.
-    """
-    if not obj or getattr(obj, "type", None) != "MESH":
-        return
-
-    key_data = get_shape_key_data(obj)
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return
-
-    if not hasattr(key_data, "skv_auto_keyframes") or not key_data.skv_auto_keyframes:
-        return
-
-    if getattr(key_data, "library", None) is not None:
-        return
-
-    frame = int(scene.frame_current)
-    eps = 1e-6
-
-    for it in key_data.skv_auto_keyframes:
-        if not getattr(it, "enabled", False):
-            continue
-        name = (it.name or "").strip()
-        if not name:
-            continue
-
-        kb = key_data.key_blocks.get(name)
-        if not kb:
-            continue
-
-        try:
-            cur_val = float(kb.value)
-        except Exception:
-            cur_val = 0.0
-
-        last_frame = int(getattr(it, "last_frame", -999999))
-        last_val = float(getattr(it, "last_value", cur_val))
-
-        if frame != last_frame:
-            it.last_frame = frame
-            it.last_value = cur_val
-            continue
-
-        if abs(cur_val - last_val) > eps:
-            try:
-                key_data.keyframe_insert(data_path=f'key_blocks["{kb.name}"].value', frame=frame)
-            except Exception:
-                pass
-            it.last_value = cur_val
 
 
 # -----------------------------
@@ -244,6 +225,8 @@ def _auto_process_active_object(scene):
 
         # Reset scan status on any change first.
         props.scan_status = ""
+        # Collapse Active Shape Keys after scanning; it auto-expands when a key becomes active.
+        props.active_keys_open = False
 
         if not desired:
             tag_redraw_view3d(ctx)
@@ -285,7 +268,50 @@ def _depsgraph_update_post(scene, depsgraph):
         obj = getattr(bpy.context, "active_object", None)
         if obj and getattr(obj, "type", None) == "MESH":
             _active_keys_update_from_values(obj)
-            _auto_keyframe_update(scene, obj)
+    except Exception:
+        pass
+    # 3) auto keyframe (enabled per shape key)
+    try:
+        props = getattr(scene, "skv_props", None)
+        obj = getattr(props, "object_pick", None) if props else None
+        if not obj:
+            obj = getattr(bpy.context, "active_object", None)
+        if obj and getattr(obj, "type", None) == "MESH":
+            key_data = get_shape_key_data(obj)
+            if key_data and hasattr(key_data, "skv_auto_keyframes") and len(key_data.skv_auto_keyframes) > 0:
+                frame = int(scene.frame_current)
+                eps = 1e-6
+
+                if getattr(key_data, "library", None) is None and getattr(key_data, "key_blocks", None):
+                    for it in key_data.skv_auto_keyframes:
+                        if not getattr(it, "enabled", False):
+                            continue
+                        name = (it.name or "").strip()
+                        if not name:
+                            continue
+                        kb = key_data.key_blocks.get(name)
+                        if not kb:
+                            continue
+
+                        try:
+                            cur_val = float(kb.value)
+                        except Exception:
+                            cur_val = 0.0
+
+                        last_frame = int(getattr(it, "last_frame", -999999))
+                        last_val = float(getattr(it, "last_value", cur_val))
+
+                        if frame != last_frame:
+                            it.last_frame = frame
+                            it.last_value = cur_val
+                            continue
+
+                        if abs(cur_val - last_val) > eps:
+                            try:
+                                key_data.keyframe_insert(data_path=f'key_blocks["{kb.name}"].value', frame=frame)
+                            except Exception:
+                                pass
+                            it.last_value = cur_val
     except Exception:
         pass
 
@@ -363,14 +389,6 @@ class SKV_Props(PropertyGroup):
     scan_status: StringProperty(name="Scan Status", default="", options={"SKIP_SAVE"})
 
     presets_open: BoolProperty(name="Presets", default=False)
-    presets_scope: EnumProperty(
-        name="Scope",
-        items=[
-            ("LOCAL", "Local", "Presets affect the active object only"),
-            ("GLOBAL", "Global", "Presets affect multiple objects"),
-        ],
-        default="LOCAL",
-    )
 
     transfer_open: BoolProperty(name="Shape Keys Transfer", default=False, update=transfer_open_update)
     move_to_group: EnumProperty(name="Move To", items=enum_groups_for_active_object)
@@ -442,9 +460,8 @@ class SKV_PT_ShapeKeysPanel(Panel):
         selected_names = set(kd_selected_set(key_data))
         has_selected_valid = any(n and n != "Basis" for n in selected_names)
 
-        # presets presence gates for "Add to preset" / "Add to global preset"
-        has_local_presets = hasattr(key_data, "skv_presets") and (len(key_data.skv_presets) > 0)
-        has_global_presets = hasattr(context.scene, "skv_global_presets") and (len(context.scene.skv_global_presets) > 0)
+        # presets presence gate
+        has_presets = hasattr(context.scene, "skv_global_presets") and (len(context.scene.skv_global_presets) > 0)
 
         # SHAPE KEYS (workspace)
         box_ws = layout.box()
@@ -483,7 +500,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
             hk = box_keys.row(align=True)
             ik = "TRIA_DOWN" if props.keys_open else "TRIA_RIGHT"
             hk.prop(props, "keys_open", text="", emboss=False, icon=ik)
-            hk.label(text=f'Keys in "{current_group}"')
+            hk.label(text=f'Shape Keys in {current_group}')
 
             if props.keys_open:
                 group_count = count_keys_in_group(key_data, current_group)
@@ -528,30 +545,17 @@ class SKV_PT_ShapeKeysPanel(Panel):
                     r1.menu("SKV_MT_move_to_group", text="Move to group", icon="FILE_FOLDER")
                     r1.operator("skv.create_group_from_selected", text="Create group", icon="NEWFOLDER")
 
-                    # Local presets: menu enabled only if presets exist; create button stays on selected-only.
                     r2 = box_keys.row(align=True)
                     r2.enabled = has_selected_valid
                     r2m = r2.row(align=True)
-                    r2m.enabled = has_selected_valid and has_local_presets
-                    r2m.menu("SKV_MT_add_to_preset", text="Add to local preset", icon="PRESET")
-                    r2.operator("skv.preset_add_from_selected", text="Create local preset", icon="PRESET")
+                    r2m.enabled = has_selected_valid and has_presets
+                    r2m.menu("SKV_MT_add_to_preset", text="Add to preset", icon="PRESET")
+                    r2.operator("skv.global_preset_add_from_selected", text="Create preset", icon="PRESET")
 
-                    # Global presets: menu enabled only if presets exist; create button stays on selected-only.
                     r3 = box_keys.row(align=True)
                     r3.enabled = has_selected_valid
-                    r3m = r3.row(align=True)
-                    r3m.enabled = has_selected_valid and has_global_presets
-                    r3m.menu("SKV_MT_add_to_global_preset", text="Add to global preset", icon="PRESET")
-                    r3.operator(
-                        "skv.global_preset_add_from_selected",
-                        text="Create global preset",
-                        icon="PRESET",
-                    )
-
-                    r4 = box_keys.row(align=True)
-                    r4.enabled = has_selected_valid
-                    r4.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
-                    r4.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
+                    r3.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
+                    r3.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
 
             # ---- Active Shape Keys (collapsible) ----
             box_active = box_ws.box()
@@ -561,9 +565,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
             ha.label(text="Active Shape Keys")
 
             if props.active_keys_open:
-                if not getattr(key_data, "skv_active_keys", None) or len(key_data.skv_active_keys) == 0:
-                    box_active.label(text="No active shape keys.", icon="INFO")
-                else:
+                if getattr(key_data, "skv_active_keys", None) or len(key_data.skv_active_keys) != 0:
                     box_active.template_list(
                         "SKV_UL_active_keys",
                         "",
@@ -571,7 +573,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
                         "skv_active_keys",
                         key_data,
                         "skv_active_keys_index",
-                        rows=6,
+                        rows=5,
                     )
 
         # PRESETS
@@ -582,73 +584,44 @@ class SKV_PT_ShapeKeysPanel(Panel):
         headp.label(text="PRESETS")
 
         if props.presets_open:
-            scope_row = boxp.row(align=True)
-            scope_row.prop(props, "presets_scope", expand=True)
+            scene = context.scene
 
-            if props.presets_scope == "LOCAL":
-                row = boxp.row()
-                row.template_list(
-                    "SKV_UL_presets",
+            row = boxp.row()
+            row.template_list(
+                "SKV_UL_global_presets",
+                "",
+                scene,
+                "skv_global_presets",
+                scene,
+                "skv_global_preset_index",
+                rows=4,
+            )
+            col = row.column(align=True)
+            col.operator("skv.global_preset_add_empty", icon="ADD", text="")
+            col.operator("skv.global_preset_remove", icon="REMOVE", text="")
+            col.separator()
+            col.operator("skv.global_preset_rename", icon="GREASEPENCIL", text="")
+
+            gpreset = presets.get_active_global_preset(scene)
+            if gpreset:
+                # Keep proxy values in sync for the preset keys UI list.
+                try:
+                    presets.sync_preset_item_values(context, gpreset)
+                except Exception:
+                    pass
+
+                boxp.separator()
+                boxp.label(text="Preset Keys")
+                rows = min(10, max(3, len(gpreset.items))) if gpreset.items else 3
+                boxp.template_list(
+                    "SKV_UL_global_preset_key_sliders",
                     "",
-                    key_data,
-                    "skv_presets",
-                    key_data,
-                    "skv_preset_index",
-                    rows=4,
+                    gpreset,
+                    "items",
+                    gpreset,
+                    "items_index",
+                    rows=rows,
                 )
-                col = row.column(align=True)
-                col.operator("skv.preset_add_empty", icon="ADD", text="")
-                col.operator("skv.preset_remove", icon="REMOVE", text="")
-                col.separator()
-                col.operator("skv.preset_rename", icon="GREASEPENCIL", text="")
-
-                preset = get_active_preset(key_data)
-                if preset:
-                    boxp.separator()
-                    boxp.label(text="Preset Keys")
-                    rows = min(10, max(3, len(preset.items))) if preset.items else 3
-                    boxp.template_list(
-                        "SKV_UL_preset_key_sliders",
-                        "",
-                        preset,
-                        "items",
-                        preset,
-                        "items_index",
-                        rows=rows,
-                    )
-
-            else:
-                scene = context.scene
-                row = boxp.row()
-                row.template_list(
-                    "SKV_UL_global_presets",
-                    "",
-                    scene,
-                    "skv_global_presets",
-                    scene,
-                    "skv_global_preset_index",
-                    rows=4,
-                )
-                col = row.column(align=True)
-                col.operator("skv.global_preset_add_empty", icon="ADD", text="")
-                col.operator("skv.global_preset_remove", icon="REMOVE", text="")
-                col.separator()
-                col.operator("skv.global_preset_rename", icon="GREASEPENCIL", text="")
-
-                gpreset = presets.get_active_global_preset(scene)
-                if gpreset:
-                    boxp.separator()
-                    boxp.label(text="Global Preset Keys")
-                    rows = min(10, max(3, len(gpreset.items))) if gpreset.items else 3
-                    boxp.template_list(
-                        "SKV_UL_global_preset_key_sliders",
-                        "",
-                        gpreset,
-                        "items",
-                        gpreset,
-                        "items_index",
-                        rows=rows,
-                    )
 
 
 # -----------------------------
@@ -669,9 +642,9 @@ def register():
 
     bpy.types.Scene.skv_props = PointerProperty(type=SKV_Props)
 
-    # Global presets storage on Scene
+    # Presets storage on Scene (global-only)
     bpy.types.Scene.skv_global_presets = CollectionProperty(type=presets.SKV_GlobalPreset)
-    bpy.types.Scene.skv_global_preset_index = IntProperty(name="Global Preset Index", default=0, min=0)
+    bpy.types.Scene.skv_global_preset_index = IntProperty(name="Preset Index", default=0, min=0)
 
     # Transfer-to dialog storage (Scene-level datablock properties support eyedropper).
     bpy.types.Scene.skv_transfer_source_name = StringProperty(options={"SKIP_SAVE"})
@@ -693,9 +666,6 @@ def register():
     # Auto keyframe tracking per shape key (stored on Key datablock)
     bpy.types.Key.skv_auto_keyframes = CollectionProperty(type=groups.SKV_AutoKeyframeEntry)
 
-    bpy.types.Key.skv_presets = CollectionProperty(type=presets.SKV_Preset)
-    bpy.types.Key.skv_preset_index = IntProperty(name="Preset Index", default=0, min=0)
-
     bpy.types.Object.skv_mesh_data_transfer = PointerProperty(type=meshDataTransfer.SKV_MeshDataSettings)
 
     _ensure_handler_installed()
@@ -711,9 +681,6 @@ def unregister():
     _ensure_handler_removed()
 
     del bpy.types.Object.skv_mesh_data_transfer
-
-    del bpy.types.Key.skv_preset_index
-    del bpy.types.Key.skv_presets
 
     if hasattr(bpy.types.Key, "skv_active_keys_index"):
         del bpy.types.Key.skv_active_keys_index
