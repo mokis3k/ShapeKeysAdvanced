@@ -147,7 +147,6 @@ def global_preset_apply(preset, context) -> None:
                 except Exception:
                     continue
 
-                # Keep Preset Keys UI list slider synchronized immediately.
                 global _PRESET_ITEM_SYNC_GUARD
                 _PRESET_ITEM_SYNC_GUARD = True
                 try:
@@ -190,6 +189,55 @@ def global_preset_apply(preset, context) -> None:
 
 def global_preset_value_update(self, context):
     global_preset_apply(self, context)
+
+
+def _autokf_get_entry(key_data, key_name: str, create: bool = False):
+    if not key_data or not hasattr(key_data, "skv_auto_keyframes"):
+        return None
+    for it in key_data.skv_auto_keyframes:
+        if it.name == key_name:
+            return it
+    if not create:
+        return None
+    it = key_data.skv_auto_keyframes.add()
+    it.name = key_name
+    return it
+
+
+def _iter_preset_key_blocks(preset):
+    for it in getattr(preset, "items", []):
+        obj = bpy.data.objects.get(it.object_name) if it.object_name else None
+        if not obj or getattr(obj, "type", None) != "MESH":
+            continue
+
+        key_data = get_shape_key_data(obj)
+        if not key_data or not getattr(key_data, "key_blocks", None):
+            continue
+
+        kb = key_data.key_blocks.get(it.key_name)
+        if not kb:
+            continue
+
+        yield key_data, kb
+
+
+def _preset_all_muted(preset) -> bool:
+    found = False
+    for _key_data, kb in _iter_preset_key_blocks(preset):
+        found = True
+        if not bool(getattr(kb, "mute", False)):
+            return False
+    return found and True
+
+
+def _preset_all_autokey_enabled(preset) -> bool:
+    found = False
+    for key_data, kb in _iter_preset_key_blocks(preset):
+        found = True
+        entry = _autokf_get_entry(key_data, kb.name, create=False)
+        if not (entry and bool(entry.enabled)):
+            return False
+    return found and True
 
 
 class SKV_GlobalPresetItem(PropertyGroup):
@@ -254,6 +302,115 @@ class SKV_OT_preset_capture_max_index(Operator):
         return {"FINISHED"}
 
 
+class SKV_OT_preset_item_capture_max(Operator):
+    bl_idname = "skv.preset_item_capture_max"
+    bl_label = "Capture Max (Item)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    item_index: IntProperty(name="Item Index", default=0)
+
+    def execute(self, context):
+        scene = context.scene
+        preset = get_active_global_preset(scene)
+        if not preset:
+            return {"CANCELLED"}
+
+        idx = int(self.item_index)
+        if idx < 0 or idx >= len(preset.items):
+            return {"CANCELLED"}
+
+        it = preset.items[idx]
+
+        obj = bpy.data.objects.get(it.object_name) if it.object_name else None
+        if not obj or getattr(obj, "type", None) != "MESH":
+            return {"CANCELLED"}
+
+        key_data = get_shape_key_data(obj)
+        if not key_data or not getattr(key_data, "key_blocks", None):
+            return {"CANCELLED"}
+        if getattr(key_data, "library", None) is not None:
+            return {"CANCELLED"}
+
+        kb = key_data.key_blocks.get(it.key_name)
+        if not kb:
+            return {"CANCELLED"}
+
+        try:
+            it.max_value = float(kb.value)
+        except Exception:
+            return {"CANCELLED"}
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+
+class SKV_OT_preset_toggle_visibility(Operator):
+    bl_idname = "skv.preset_toggle_visibility"
+    bl_label = "Toggle Preset Visibility"
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset_index: IntProperty(name="Preset Index", default=0)
+
+    def execute(self, context):
+        scene = context.scene
+        idx = int(self.preset_index)
+        if idx < 0 or idx >= len(scene.skv_global_presets):
+            return {"CANCELLED"}
+
+        preset = scene.skv_global_presets[idx]
+        target_mute = not _preset_all_muted(preset)
+
+        changed = False
+        for _key_data, kb in _iter_preset_key_blocks(preset):
+            try:
+                kb.mute = target_mute
+                changed = True
+            except Exception:
+                pass
+
+        if not changed:
+            return {"CANCELLED"}
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+
+class SKV_OT_preset_toggle_auto_keyframe(Operator):
+    bl_idname = "skv.preset_toggle_auto_keyframe"
+    bl_label = "Toggle Preset Auto Keyframe"
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset_index: IntProperty(name="Preset Index", default=0)
+
+    def execute(self, context):
+        scene = context.scene
+        idx = int(self.preset_index)
+        if idx < 0 or idx >= len(scene.skv_global_presets):
+            return {"CANCELLED"}
+
+        preset = scene.skv_global_presets[idx]
+        target_enabled = not _preset_all_autokey_enabled(preset)
+
+        changed = False
+        for key_data, kb in _iter_preset_key_blocks(preset):
+            if getattr(key_data, "library", None) is not None:
+                continue
+            entry = _autokf_get_entry(key_data, kb.name, create=True)
+            if not entry:
+                continue
+            try:
+                entry.enabled = target_enabled
+                changed = True
+            except Exception:
+                pass
+
+        if not changed:
+            return {"CANCELLED"}
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+
 class SKV_UL_global_presets(UIList):
     bl_idname = "SKV_UL_global_presets"
 
@@ -263,8 +420,13 @@ class SKV_UL_global_presets(UIList):
         row.prop(preset, "name", text="", emboss=False, icon="PRESET")
         row.prop(preset, "value", text="", slider=True)
 
-        op = row.operator("skv.preset_capture_max_index", text="", icon="COPYDOWN", emboss=True)
-        op.preset_index = index
+        vis_icon = "HIDE_ON" if _preset_all_muted(preset) else "HIDE_OFF"
+        opv = row.operator("skv.preset_toggle_visibility", text="", icon=vis_icon, emboss=False)
+        opv.preset_index = index
+
+        kf_icon = "KEYFRAME_HLT" if _preset_all_autokey_enabled(preset) else "KEYFRAME"
+        opk = row.operator("skv.preset_toggle_auto_keyframe", text="", icon=kf_icon, emboss=False)
+        opk.preset_index = index
 
 
 class SKV_UL_global_preset_key_sliders(UIList):
@@ -277,6 +439,9 @@ class SKV_UL_global_preset_key_sliders(UIList):
         label = f"{it.object_name}: {it.key_name}" if it.object_name else it.key_name
         row.label(text=label, icon="SHAPEKEY_DATA")
         row.prop(it, "value", text="", slider=True)
+
+        op = row.operator("skv.preset_item_capture_max", text="", icon="COPYDOWN", emboss=True)
+        op.item_index = index
 
 
 class SKV_MT_add_to_preset(Menu):
@@ -531,6 +696,9 @@ CLASSES = (
     SKV_GlobalPresetItem,
     SKV_GlobalPreset,
     SKV_OT_preset_capture_max_index,
+    SKV_OT_preset_item_capture_max,
+    SKV_OT_preset_toggle_visibility,
+    SKV_OT_preset_toggle_auto_keyframe,
     SKV_UL_global_presets,
     SKV_UL_global_preset_key_sliders,
     SKV_MT_add_to_preset,
