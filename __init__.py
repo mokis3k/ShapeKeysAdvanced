@@ -22,7 +22,6 @@ from bpy.props import (
 
 from .common import (
     enum_groups_for_active_object,
-    show_select_update,
     get_shape_key_data,
     has_group_storage,
     is_initialized,
@@ -31,6 +30,9 @@ from .common import (
     tag_redraw_view3d,
     INIT_GROUP_NAME,
     kd_selected_set,
+    kd_get_group,
+    kd_set_selected,
+    kd_clear_selected,
     is_internal_value_change,
 )
 from . import groups
@@ -358,10 +360,55 @@ def transfer_open_update(self, context):
                 pass
 
 
+def affix_select_update(self, context):
+    obj = getattr(self, "object_pick", None)
+    if not obj:
+        return
+
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return
+    if not has_group_storage(key_data) or not is_initialized(key_data):
+        return
+
+    kd_clear_selected(key_data)
+
+    text = (getattr(self, "affix_value", "") or "").strip()
+    if not text:
+        tag_redraw_view3d(context)
+        return
+
+    text_l = text.lower()
+    mode = getattr(self, "affix_type", "PREFIX")
+    group_name = get_selected_group_name(key_data)
+    matched = []
+
+    for kb in key_data.key_blocks:
+        if kb.name == "Basis":
+            continue
+        if kd_get_group(key_data, kb.name) != group_name:
+            continue
+
+        kb_name_l = kb.name.lower()
+
+        if mode == "PREFIX" and kb_name_l.startswith(text_l):
+            matched.append(kb.name)
+        elif mode == "SUFFIX" and kb_name_l.endswith(text_l):
+            matched.append(kb.name)
+
+    for name in matched:
+        kd_set_selected(key_data, name, True)
+
+    if matched:
+        self.last_affix_name = text
+        self.last_affix_pending = True
+
+    tag_redraw_view3d(context)
+
+
 class SKV_Props(PropertyGroup):
     keys_index: IntProperty(name="Keys Index", default=-1, min=-1)
     search: StringProperty(name="Search", default="")
-    show_select: BoolProperty(name="Select", default=False, update=show_select_update)
 
     # Group workspace top-level container (collapsible)
     groups_module_open: BoolProperty(name="Shape Keys", default=True)
@@ -400,11 +447,13 @@ class SKV_Props(PropertyGroup):
             ("SUFFIX", "Suffix", "Select by suffix"),
         ],
         default="PREFIX",
+        update=affix_select_update,
     )
     affix_value: StringProperty(
         name="Value",
         default="",
         description="Comma/semicolon separated list (e.g. L_, R_ or _L, _R)",
+        update=affix_select_update,
     )
 
     # Tracks last "Apply" input from Prefix/Suffix selector.
@@ -509,18 +558,13 @@ class SKV_PT_ShapeKeysPanel(Panel):
                 row.operator("skv.search_clear", text="", icon="X")
 
                 row = box_keys.row(align=True)
-                row.prop(props, "show_select", text="Select", toggle=True)
+                row.operator("skv.select_visible", text="All").mode = "ALL"
+                row.operator("skv.select_visible", text="Clear").mode = "CLEAR"
+                row.operator("skv.select_visible", text="Invert").mode = "INVERT"
 
-                if props.show_select:
-                    row = box_keys.row(align=True)
-                    row.operator("skv.select_visible", text="All").mode = "ALL"
-                    row.operator("skv.select_visible", text="Clear").mode = "NONE"
-                    row.operator("skv.select_visible", text="Invert").mode = "INVERT"
-
-                    row = box_keys.row(align=True)
-                    row.prop(props, "affix_type", text="")
-                    row.prop(props, "affix_value", text="")
-                    row.operator("skv.select_by_affix", text="Apply", icon="FILTER")
+                row = box_keys.row(align=True)
+                row.prop(props, "affix_type", text="")
+                row.prop(props, "affix_value", text="", icon="FILTER")
 
             key_rows = max(1, min(group_count, 5))
             box_keys.template_list(
@@ -533,23 +577,20 @@ class SKV_PT_ShapeKeysPanel(Panel):
                 rows=key_rows,
             )
 
-            if props.show_select and group_count > 0:
+            if has_selected_valid and group_count > 0:
                 box_keys.separator()
 
                 r1 = box_keys.row(align=True)
-                r1.enabled = has_selected_valid
                 r1.menu("SKV_MT_move_to_group", text="Move to group", icon="FILE_FOLDER")
                 r1.operator("skv.create_group_from_selected", text="Create group", icon="NEWFOLDER")
 
                 r2 = box_keys.row(align=True)
-                r2.enabled = has_selected_valid
                 r2m = r2.row(align=True)
-                r2m.enabled = has_selected_valid and has_presets
+                r2m.enabled = has_presets
                 r2m.menu("SKV_MT_add_to_preset", text="Add to preset", icon="PRESET")
                 r2.operator("skv.global_preset_add_from_selected", text="Create preset", icon="PRESET")
 
                 r3 = box_keys.row(align=True)
-                r3.enabled = has_selected_valid
                 r3.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
                 r3.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
 

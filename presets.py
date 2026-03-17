@@ -99,17 +99,6 @@ def _preset_item_value_update(self, context):
         except Exception:
             pass
 
-        try:
-            if hasattr(key_data, "skv_active_keys"):
-                i = 0
-                while i < len(key_data.skv_active_keys):
-                    if key_data.skv_active_keys[i].name == kb.name:
-                        key_data.skv_active_keys.remove(i)
-                    else:
-                        i += 1
-        except Exception:
-            pass
-
     tag_redraw_view3d(context)
 
 
@@ -168,17 +157,6 @@ def global_preset_apply(preset, context) -> None:
                             d = key_data.skv_key_defaults.add()
                             d.name = kb.name
                             d.value = float(new_val)
-                except Exception:
-                    pass
-
-                try:
-                    if hasattr(key_data, "skv_active_keys"):
-                        i = 0
-                        while i < len(key_data.skv_active_keys):
-                            if key_data.skv_active_keys[i].name == kb.name:
-                                key_data.skv_active_keys.remove(i)
-                            else:
-                                i += 1
                 except Exception:
                     pass
     finally:
@@ -392,6 +370,7 @@ class SKV_OT_preset_toggle_auto_keyframe(Operator):
         target_enabled = not _preset_all_autokey_enabled(preset)
 
         changed = False
+        frame = int(context.scene.frame_current)
         for key_data, kb in _iter_preset_key_blocks(preset):
             if getattr(key_data, "library", None) is not None:
                 continue
@@ -400,6 +379,18 @@ class SKV_OT_preset_toggle_auto_keyframe(Operator):
                 continue
             try:
                 entry.enabled = target_enabled
+                entry.last_frame = frame
+                try:
+                    entry.last_value = float(kb.value)
+                except Exception:
+                    entry.last_value = 0.0
+
+                if target_enabled:
+                    try:
+                        key_data.keyframe_insert(data_path=f'key_blocks["{kb.name}"].value', frame=frame)
+                    except Exception:
+                        pass
+
                 changed = True
             except Exception:
                 pass

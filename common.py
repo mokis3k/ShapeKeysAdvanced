@@ -402,17 +402,6 @@ def preset_apply(preset, context) -> None:
                 except Exception:
                     pass
 
-                # Remove from active list if present.
-                try:
-                    if hasattr(key_data, "skv_active_keys"):
-                        i = 0
-                        while i < len(key_data.skv_active_keys):
-                            if key_data.skv_active_keys[i].name == kb.name:
-                                key_data.skv_active_keys.remove(i)
-                            else:
-                                i += 1
-                except Exception:
-                    pass
     finally:
         _PRESET_APPLY_GUARD = False
 

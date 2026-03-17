@@ -107,7 +107,7 @@ class SKV_UL_key_blocks(UIList):
             return [], []
 
         group_name = get_selected_group_name(key_data)
-        tokens = parse_tokens(getattr(props, "key_search", ""))
+        tokens = [t.lower() for t in parse_tokens(getattr(props, "search", ""))]
 
         flt_flags = []
         flt_neworder = []
@@ -138,10 +138,9 @@ class SKV_UL_key_blocks(UIList):
 
         row = layout.row(align=True)
 
-        if props.show_select:
-            icon_id = "CHECKBOX_HLT" if kd_is_selected(key_data, kb.name) else "CHECKBOX_DEHLT"
-            op = row.operator("skv.key_toggle_select", text="", icon=icon_id, emboss=False)
-            op.key_index = index
+        icon_id = "CHECKBOX_HLT" if kd_is_selected(key_data, kb.name) else "CHECKBOX_DEHLT"
+        op = row.operator("skv.key_toggle_select", text="", icon=icon_id, emboss=False)
+        op.key_index = index
 
         row.prop(kb, "value", text=kb.name, slider=True)
 
@@ -401,7 +400,7 @@ class SKV_OT_SelectVisible(Operator):
 
         props = context.scene.skv_props
         group_name = get_selected_group_name(key_data)
-        search_tokens = parse_tokens(getattr(props, "key_search", ""))
+        search_tokens = [t.lower() for t in parse_tokens(getattr(props, "search", ""))]
 
         visible_names = []
         for kb in key_data.key_blocks:
@@ -454,7 +453,7 @@ class SKV_OT_SelectByAffix(Operator):
             return {"CANCELLED"}
 
         props = context.scene.skv_props
-        text = (props.affix_text or "").strip()
+        text = (props.affix_value or "").strip()
         if not text:
             self.report({"INFO"}, "Enter prefix/suffix text.")
             return {"CANCELLED"}
