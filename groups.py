@@ -88,7 +88,10 @@ class SKV_UL_Groups(UIList):
         key_data = data
 
         row = layout.row(align=True)
-        row.prop(g, "name", text="", emboss=False, icon="FILE_FOLDER")
+        if g.name == INIT_GROUP_NAME:
+            row.label(text=g.name, icon="FILE_FOLDER")
+        else:
+            row.prop(g, "name", text="", emboss=False, icon="FILE_FOLDER")
         try:
             cnt = count_keys_in_group(key_data, g.name)
         except Exception:
@@ -279,6 +282,7 @@ class SKV_OT_ActiveKeyRemove(Operator):
                     it.value = cur_val
             except Exception:
                 pass
+
 
         tag_redraw_view3d(context)
         return {"FINISHED"}
@@ -859,6 +863,7 @@ class SKV_OT_TransferTo(Operator):
     def draw(self, context):
         layout = self.layout
         layout.prop(context.scene, "skv_transfer_target", text="Target")
+        layout.prop(context.scene.skv_props, "transfer_inheritance", text="Inheritance")
 
     @classmethod
     def poll(cls, context):
@@ -873,6 +878,7 @@ class SKV_OT_TransferTo(Operator):
 
     def execute(self, context):
         from .meshDataTransfer import MeshDataTransfer
+        from . import presets
 
         source = get_active_object(context)
         if not source:
@@ -899,6 +905,23 @@ class SKV_OT_TransferTo(Operator):
         if not ok:
             self.report({"WARNING"}, "Nothing transferred")
             return {"CANCELLED"}
+
+        target_key_data = get_shape_key_data(target)
+        if target_key_data and getattr(target_key_data, "key_blocks", None):
+            with InternalValueChangeGuard():
+                for key_name in selected_names:
+                    src_kb = key_data.key_blocks.get(key_name)
+                    dst_kb = target_key_data.key_blocks.get(key_name)
+                    if not src_kb or not dst_kb:
+                        continue
+                    try:
+                        dst_kb.value = float(src_kb.value)
+                    except Exception:
+                        pass
+
+        inherited_count = 0
+        if getattr(context.scene.skv_props, "transfer_inheritance", False):
+            inherited_count = presets.inherit_transferred_keys_to_presets(source, target, selected_names)
 
         clear_selection_ui(context, key_data)
 

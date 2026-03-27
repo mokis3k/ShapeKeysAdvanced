@@ -1,6 +1,6 @@
 import bpy
 from bpy.types import Operator, PropertyGroup, UIList, Menu
-from bpy.props import IntProperty, FloatProperty, StringProperty, CollectionProperty
+from bpy.props import IntProperty, FloatProperty, StringProperty, CollectionProperty, BoolProperty
 
 from .common import (
     get_active_object,
@@ -16,6 +16,12 @@ from .common import (
 
 _PRESET_ITEM_SYNC_GUARD = False
 _GLOBAL_PRESET_APPLY_GUARD = False
+_PRESET_LIST_FILTER_OBJECT = ""
+
+
+def set_preset_list_filter_object(object_name: str) -> None:
+    global _PRESET_LIST_FILTER_OBJECT
+    _PRESET_LIST_FILTER_OBJECT = (object_name or "").strip()
 
 
 def get_active_global_preset(scene):
@@ -218,9 +224,122 @@ def _preset_all_autokey_enabled(preset) -> bool:
     return found and True
 
 
+def preset_item_capture_max_enabled(it) -> bool:
+    obj = bpy.data.objects.get(it.object_name) if getattr(it, "object_name", "") else None
+    if not obj or getattr(obj, "type", None) != "MESH":
+        return False
+
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return False
+
+    kb = key_data.key_blocks.get(it.key_name)
+    if not kb:
+        return False
+
+    try:
+        return abs(float(kb.value) - float(it.max_value)) > 1e-6
+    except Exception:
+        return False
+
+
+def iter_preset_items_grouped(preset):
+    grouped = {}
+    order = []
+    for idx, it in enumerate(getattr(preset, "items", [])):
+        obj_name = (it.object_name or "").strip()
+        if not obj_name:
+            obj_name = "Unknown Object"
+        if obj_name not in grouped:
+            grouped[obj_name] = []
+            order.append(obj_name)
+        grouped[obj_name].append((idx, it))
+
+    for obj_name in order:
+        items = grouped[obj_name]
+        controller_item = items[0][1] if items else None
+        yield obj_name, items, controller_item
+
+
+def _set_item_value_from_key_block(it, kb) -> None:
+    global _PRESET_ITEM_SYNC_GUARD
+    try:
+        it.max_value = float(kb.value)
+        _PRESET_ITEM_SYNC_GUARD = True
+        try:
+            it.value = float(kb.value)
+        finally:
+            _PRESET_ITEM_SYNC_GUARD = False
+    except Exception:
+        it.max_value = 0.0
+        _PRESET_ITEM_SYNC_GUARD = True
+        try:
+            it.value = 0.0
+        finally:
+            _PRESET_ITEM_SYNC_GUARD = False
+
+
+def add_shape_key_to_preset(preset, obj, key_name: str):
+    if not preset or not obj or getattr(obj, "type", None) != "MESH" or not key_name:
+        return False
+
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return False
+
+    kb = key_data.key_blocks.get(key_name)
+    if not kb:
+        return False
+
+    for it in preset.items:
+        if it.object_name == obj.name and it.key_name == key_name:
+            return False
+
+    it = preset.items.add()
+    it.object_name = obj.name
+    it.key_name = key_name
+    it.object_open = True
+    _set_item_value_from_key_block(it, kb)
+    return True
+
+
+def inherit_transferred_keys_to_presets(source_obj, target_obj, key_names) -> int:
+    if not source_obj or not target_obj or source_obj == target_obj:
+        return 0
+    if getattr(source_obj, "type", None) != "MESH" or getattr(target_obj, "type", None) != "MESH":
+        return 0
+
+    names = [n for n in (key_names or []) if n]
+    if not names:
+        return 0
+
+    scene = bpy.context.scene
+    if not scene or not hasattr(scene, "skv_global_presets"):
+        return 0
+
+    selected_names = set(names)
+    inherited_count = 0
+
+    for preset in scene.skv_global_presets:
+        source_keys_in_preset = {
+            it.key_name
+            for it in preset.items
+            if it.object_name == source_obj.name and it.key_name in selected_names
+        }
+        if not source_keys_in_preset:
+            continue
+
+        for key_name in source_keys_in_preset:
+            if add_shape_key_to_preset(preset, target_obj, key_name):
+                inherited_count += 1
+
+    return inherited_count
+
+
 class SKV_GlobalPresetItem(PropertyGroup):
     object_name: StringProperty(name="Object", default="")
     key_name: StringProperty(name="Shape Key", default="")
+    object_open: BoolProperty(name="Object Open", default=True)
     max_value: FloatProperty(name="Max", default=1.0)
 
     value: FloatProperty(
@@ -368,9 +487,9 @@ class SKV_OT_preset_toggle_auto_keyframe(Operator):
 
         preset = scene.skv_global_presets[idx]
         target_enabled = not _preset_all_autokey_enabled(preset)
+        frame = int(context.scene.frame_current)
 
         changed = False
-        frame = int(context.scene.frame_current)
         for key_data, kb in _iter_preset_key_blocks(preset):
             if getattr(key_data, "library", None) is not None:
                 continue
@@ -423,15 +542,31 @@ class SKV_UL_global_presets(UIList):
 class SKV_UL_global_preset_key_sliders(UIList):
     bl_idname = "SKV_UL_global_preset_key_sliders"
 
+    def filter_items(self, context, data, propname):
+        items = getattr(data, propname)
+        flt_flags = []
+        flt_neworder = []
+
+        target = _PRESET_LIST_FILTER_OBJECT
+        bitflag = self.bitflag_filter_item
+
+        for it in items:
+            if not target or (it.object_name == target):
+                flt_flags.append(bitflag)
+            else:
+                flt_flags.append(0)
+
+        return flt_flags, flt_neworder
+
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         it = item
         row = layout.row(align=True)
-
-        label = f"{it.object_name}: {it.key_name}" if it.object_name else it.key_name
-        row.label(text=label, icon="SHAPEKEY_DATA")
+        row.label(text=it.key_name, icon="SHAPEKEY_DATA")
         row.prop(it, "value", text="", slider=True)
 
-        op = row.operator("skv.preset_item_capture_max", text="", icon="COPYDOWN", emboss=True)
+        op_row = row.row(align=True)
+        op_row.enabled = preset_item_capture_max_enabled(it)
+        op = op_row.operator("skv.preset_item_capture_max", text="", icon="COPYDOWN", emboss=True)
         op.item_index = index
 
 
@@ -497,39 +632,10 @@ class SKV_OT_add_selected_to_preset(Operator):
             return {"CANCELLED"}
 
         preset = scene.skv_global_presets[self.preset_index]
-        existing = {(it.object_name, it.key_name) for it in preset.items if it.object_name and it.key_name}
-
-        kb_map = key_data.key_blocks
         added = 0
         for kname in selected:
-            key_pair = (obj.name, kname)
-            if key_pair in existing:
-                continue
-            kb = kb_map.get(kname)
-            if not kb:
-                continue
-
-            it = preset.items.add()
-            it.object_name = obj.name
-            it.key_name = kname
-            try:
-                it.max_value = float(kb.value)
-                global _PRESET_ITEM_SYNC_GUARD
-                _PRESET_ITEM_SYNC_GUARD = True
-                try:
-                    it.value = float(kb.value)
-                finally:
-                    _PRESET_ITEM_SYNC_GUARD = False
-            except Exception:
-                it.max_value = 0.0
-                _PRESET_ITEM_SYNC_GUARD = True
-                try:
-                    it.value = 0.0
-                finally:
-                    _PRESET_ITEM_SYNC_GUARD = False
-
-            existing.add(key_pair)
-            added += 1
+            if add_shape_key_to_preset(preset, obj, kname):
+                added += 1
 
         if added == 0:
             self.report({"INFO"}, "Nothing added (already present or invalid).")
@@ -638,32 +744,12 @@ class SKV_OT_GlobalPresetAddFromSelected(Operator):
         preset.name = name
         preset.items.clear()
 
-        kb_map = key_data.key_blocks
         added = 0
         for kname in selected:
             if _is_basis_name(key_data, kname):
                 continue
-            kb = kb_map.get(kname)
-            if not kb:
-                continue
-            it = preset.items.add()
-            it.object_name = obj.name
-            it.key_name = kname
-            try:
-                it.max_value = float(kb.value)
-                _PRESET_ITEM_SYNC_GUARD = True
-                try:
-                    it.value = float(kb.value)
-                finally:
-                    _PRESET_ITEM_SYNC_GUARD = False
-            except Exception:
-                it.max_value = 0.0
-                _PRESET_ITEM_SYNC_GUARD = True
-                try:
-                    it.value = 0.0
-                finally:
-                    _PRESET_ITEM_SYNC_GUARD = False
-            added += 1
+            if add_shape_key_to_preset(preset, obj, kname):
+                added += 1
 
         if added == 0:
             scene.skv_global_presets.remove(len(scene.skv_global_presets) - 1)
