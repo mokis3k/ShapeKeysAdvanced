@@ -641,6 +641,11 @@ class SKV_OT_add_selected_to_preset(Operator):
             self.report({"INFO"}, "Nothing added (already present or invalid).")
             return {"CANCELLED"}
 
+        try:
+            context.scene.skv_props.presets_open = True
+        except Exception:
+            pass
+
         tag_redraw_view3d(context)
         return {"FINISHED"}
 

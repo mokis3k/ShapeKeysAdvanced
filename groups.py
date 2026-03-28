@@ -208,9 +208,18 @@ class SKV_MT_MoveToGroup(Menu):
             layout.label(text="No groups")
             return
 
+        current_group = get_selected_group_name(key_data)
+
+        has_target_groups = False
         for g in key_data.skv_groups:
+            if g.name == current_group:
+                continue
+            has_target_groups = True
             op = layout.operator("skv.move_selected_to_group", text=g.name, icon="FILE_FOLDER")
             op.group = g.name
+
+        if not has_target_groups:
+            layout.label(text="No other groups")
 
 
 class SKV_MT_SelectActions(Menu):
@@ -282,7 +291,6 @@ class SKV_OT_ActiveKeyRemove(Operator):
                     it.value = cur_val
             except Exception:
                 pass
-
 
         tag_redraw_view3d(context)
         return {"FINISHED"}
