@@ -11,12 +11,29 @@ from .common import (
     ensure_init_setup_write,
     kd_selected_set,
     _is_basis_name,
-    InternalValueChangeGuard,
 )
 
 _PRESET_ITEM_SYNC_GUARD = False
 _GLOBAL_PRESET_APPLY_GUARD = False
 _PRESET_LIST_FILTER_OBJECT = ""
+
+
+def _make_unique_preset_name(scene, base_name: str) -> str:
+    base = (base_name or "").strip()
+    if not base:
+        base = "Preset"
+
+    existing = set()
+    if scene and hasattr(scene, "skv_global_presets"):
+        existing = {p.name for p in scene.skv_global_presets}
+
+    if base not in existing:
+        return base
+
+    index = 1
+    while f"{base} {index}" in existing:
+        index += 1
+    return f"{base} {index}"
 
 
 def set_preset_list_filter_object(object_name: str) -> None:
@@ -84,26 +101,10 @@ def _preset_item_value_update(self, context):
     except Exception:
         return
 
-    with InternalValueChangeGuard():
-        try:
-            kb.value = new_val
-        except Exception:
-            return
-
-        try:
-            if hasattr(key_data, "skv_key_defaults"):
-                updated = False
-                for d in key_data.skv_key_defaults:
-                    if d.name == kb.name:
-                        d.value = float(new_val)
-                        updated = True
-                        break
-                if not updated:
-                    d = key_data.skv_key_defaults.add()
-                    d.name = kb.name
-                    d.value = float(new_val)
-        except Exception:
-            pass
+    try:
+        kb.value = new_val
+    except Exception:
+        return
 
     tag_redraw_view3d(context)
 
@@ -136,35 +137,19 @@ def global_preset_apply(preset, context) -> None:
             except Exception:
                 continue
 
-            with InternalValueChangeGuard():
-                try:
-                    kb.value = new_val
-                except Exception:
-                    continue
+            try:
+                kb.value = new_val
+            except Exception:
+                continue
 
-                global _PRESET_ITEM_SYNC_GUARD
-                _PRESET_ITEM_SYNC_GUARD = True
-                try:
-                    it.value = float(new_val)
-                except Exception:
-                    pass
-                finally:
-                    _PRESET_ITEM_SYNC_GUARD = False
-
-                try:
-                    if hasattr(key_data, "skv_key_defaults"):
-                        updated = False
-                        for d in key_data.skv_key_defaults:
-                            if d.name == kb.name:
-                                d.value = float(new_val)
-                                updated = True
-                                break
-                        if not updated:
-                            d = key_data.skv_key_defaults.add()
-                            d.name = kb.name
-                            d.value = float(new_val)
-                except Exception:
-                    pass
+            global _PRESET_ITEM_SYNC_GUARD
+            _PRESET_ITEM_SYNC_GUARD = True
+            try:
+                it.value = float(new_val)
+            except Exception:
+                pass
+            finally:
+                _PRESET_ITEM_SYNC_GUARD = False
     finally:
         _GLOBAL_PRESET_APPLY_GUARD = False
 
@@ -527,6 +512,7 @@ class SKV_UL_global_presets(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         preset = item
         row = layout.row(align=True)
+
         row.prop(preset, "name", text="", emboss=False, icon="PRESET")
         row.prop(preset, "value", text="", slider=True)
 
@@ -561,7 +547,8 @@ class SKV_UL_global_preset_key_sliders(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         it = item
         row = layout.row(align=True)
-        row.label(text=it.key_name, icon="SHAPEKEY_DATA")
+
+        row.label(text=it.key_name)
         row.prop(it, "value", text="", slider=True)
 
         op_row = row.row(align=True)
@@ -657,8 +644,14 @@ class SKV_OT_GlobalPresetAddEmpty(Operator):
 
     def execute(self, context):
         scene = context.scene
+
+        try:
+            scene.skv_props.skip_next_object_sync = True
+        except Exception:
+            pass
+
         preset = scene.skv_global_presets.add()
-        preset.name = "Preset"
+        preset.name = _make_unique_preset_name(scene, "Preset")
         preset.value = 0.0
         scene.skv_global_preset_index = max(0, len(scene.skv_global_presets) - 1)
 
@@ -744,7 +737,7 @@ class SKV_OT_GlobalPresetAddFromSelected(Operator):
 
         ensure_init_setup_write(obj)
 
-        name = (self.name or "Preset").strip() or "Preset"
+        name = _make_unique_preset_name(scene, self.name)
         preset = scene.skv_global_presets.add()
         preset.name = name
         preset.items.clear()

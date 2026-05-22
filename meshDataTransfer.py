@@ -382,6 +382,13 @@ class MeshDataTransfer:
             except Exception:
                 pass
 
+        # Force Basis to a neutral slider value after transfer.
+        try:
+            if self.target.shape_keys and self.target.shape_keys.get("Basis"):
+                self.target.shape_keys.get("Basis").value = 0.0
+        except Exception:
+            pass
+
         # Restore active key index (best-effort).
         try:
             target_obj.active_shape_key_index = pre_active_index if self.target.shape_keys else 0
@@ -389,7 +396,6 @@ class MeshDataTransfer:
             pass
 
         return True
-
 
 # -----------------------------------------------------------------------------
 # Properties
