@@ -548,7 +548,18 @@ class SKV_UL_global_preset_key_sliders(UIList):
         it = item
         row = layout.row(align=True)
 
-        row.label(text=it.key_name)
+        kb = None
+        obj = bpy.data.objects.get(it.object_name) if it.object_name else None
+        if obj and getattr(obj, "type", None) == "MESH":
+            key_data = get_shape_key_data(obj)
+            if key_data and getattr(key_data, "key_blocks", None):
+                kb = key_data.key_blocks.get(it.key_name)
+
+        if kb:
+            row.prop(kb, "name", text="", emboss=False)
+        else:
+            row.label(text=it.key_name or "Invalid", icon="ERROR")
+
         row.prop(it, "value", text="", slider=True)
 
         op_row = row.row(align=True)

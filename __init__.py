@@ -237,6 +237,88 @@ def _shape_key_signature(obj) -> str:
 
     return "|".join(names)
 
+def _shape_key_names_from_signature(signature: str):
+    if not signature:
+        return []
+    if signature in {"NO_SHAPE_KEYS", "SHAPE_KEYS_UNKNOWN"}:
+        return []
+    return signature.split("|")
+
+
+def _rename_collection_entry_names(collection, old_name: str, new_name: str) -> None:
+    if not collection or not old_name or not new_name or old_name == new_name:
+        return
+
+    for it in collection:
+        try:
+            if getattr(it, "name", "") == old_name:
+                it.name = new_name
+        except Exception:
+            pass
+
+def _sync_shape_key_rename_mappings(scene, obj, key_data, previous_signature: str, current_signature: str) -> None:
+    # Keep addon name-based metadata consistent after direct KeyBlock.name edits.
+    old_names = _shape_key_names_from_signature(previous_signature)
+    new_names = _shape_key_names_from_signature(current_signature)
+
+    if not old_names or not new_names:
+        return
+    if len(old_names) != len(new_names):
+        return
+    if old_names == new_names:
+        return
+
+    old_set = set(old_names)
+    new_set = set(new_names)
+
+    for old_name, new_name in zip(old_names, new_names):
+        if old_name == new_name:
+            continue
+
+        # Treat only pure rename at the same index.
+        # If both names still exist, this is likely a reorder or ambiguous change.
+        if old_name in new_set or new_name in old_set:
+            continue
+
+        try:
+            if hasattr(key_data, "skv_key_groups"):
+                _rename_collection_entry_names(key_data.skv_key_groups, old_name, new_name)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(key_data, "skv_selected"):
+                _rename_collection_entry_names(key_data.skv_selected, old_name, new_name)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(key_data, "skv_key_defaults"):
+                _rename_collection_entry_names(key_data.skv_key_defaults, old_name, new_name)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(key_data, "skv_active_keys"):
+                _rename_collection_entry_names(key_data.skv_active_keys, old_name, new_name)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(key_data, "skv_auto_keyframes"):
+                _rename_collection_entry_names(key_data.skv_auto_keyframes, old_name, new_name)
+        except Exception:
+            pass
+
+        try:
+            if scene and hasattr(scene, "skv_global_presets") and obj:
+                for preset in scene.skv_global_presets:
+                    for it in preset.items:
+                        if it.object_name == obj.name and it.key_name == old_name:
+                            it.key_name = new_name
+        except Exception:
+            pass
+
 
 def _auto_process_active_object(scene):
     """
@@ -268,7 +350,19 @@ def _auto_process_active_object(scene):
     _SKV_SYNC_GUARD = True
     try:
         previous_name = getattr(props, "last_active_object_name", "")
+        previous_signature = getattr(props, "last_shape_key_signature", "")
         object_changed = previous_name != desired_name
+
+        if desired and previous_name == desired_name:
+            rename_key_data = get_shape_key_data(desired)
+            if rename_key_data and getattr(rename_key_data, "key_blocks", None):
+                _sync_shape_key_rename_mappings(
+                    scene,
+                    desired,
+                    rename_key_data,
+                    previous_signature,
+                    desired_signature,
+                )
 
         props.last_active_object_name = desired_name
         props.last_shape_key_signature = desired_signature
@@ -400,7 +494,7 @@ class SKV_UL_quick_shape_keys(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         kb = item
         row = layout.row(align=True)
-        row.label(text=kb.name)
+        row.prop(kb, "name", text="", emboss=False)
         row.prop(kb, "value", text="", slider=True)
 
         op = row.operator("skv.quick_shape_key_delete", text="", icon="TRASH", emboss=False)
@@ -723,6 +817,52 @@ class SKV_Props(PropertyGroup):
     last_affix_pending: BoolProperty(name="Last Affix Pending", default=False)
 
 
+def _draw_quick_shape_keys_block(layout, context, obj, key_data=None):
+    props = context.scene.skv_props
+
+    quick_col = layout.column(align=True)
+
+    if props.quick_shape_key_editing:
+        if props.quick_shape_key_name:
+            quick_col.label(text=f"Editing: {props.quick_shape_key_name}")
+        quick_col.operator("skv.quick_shape_key_fix", text="Fix", icon="CHECKMARK")
+    else:
+        quick_col.operator("skv.quick_shape_key_add", text="Add Quick Shape Keys", icon="ADD")
+
+    hq = quick_col.row(align=True)
+    iq = "TRIA_DOWN" if props.quick_keys_open else "TRIA_RIGHT"
+    hq.prop(props, "quick_keys_open", text="", emboss=False, icon=iq)
+    hq.label(text="Quick Shape Keys")
+
+    if not props.quick_keys_open:
+        return
+
+    if not obj:
+        quick_col.label(text="No selected object", icon="INFO")
+        return
+
+    if getattr(obj, "type", None) != "MESH":
+        quick_col.label(text="Active object is not a mesh", icon="INFO")
+        return
+
+    if key_data is None:
+        key_data = get_shape_key_data(obj)
+
+    quick_keys = _iter_quick_shape_keys(key_data)
+
+    if quick_keys:
+        quick_rows = max(1, min(len(quick_keys), 5))
+        quick_col.template_list(
+            "SKV_UL_quick_shape_keys",
+            "",
+            key_data,
+            "key_blocks",
+            props,
+            "quick_keys_index",
+            rows=quick_rows,
+        )
+
+
 class SKV_PT_ObjectPanel(Panel):
     bl_label = "Object"
     bl_idname = "SKV_PT_object_panel"
@@ -769,6 +909,8 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
             row = layout.row(align=True)
             row.operator("skv.transfer_from", text="Transfer from...", icon="IMPORT")
+
+            _draw_quick_shape_keys_block(layout, context, obj, key_data)
             return
         if not has_group_storage(key_data):
             return
@@ -861,6 +1003,8 @@ class SKV_PT_ShapeKeysPanel(Panel):
                 r3.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
                 r3.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
 
+        _draw_quick_shape_keys_block(layout, context, obj, key_data)
+
         active_col = layout.column(align=True)
         ha = active_col.row(align=True)
         ia = "TRIA_DOWN" if props.active_keys_open else "TRIA_RIGHT"
@@ -879,63 +1023,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
                     key_data,
                     "skv_active_keys_index",
                     rows=active_rows,
-                )
-
-
-class SKV_PT_QuickShapeKeyPanel(Panel):
-    bl_label = "Quick Shape Key"
-    bl_idname = "SKV_PT_quick_shape_key_panel"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "ShapeKeys"
-    bl_order = 20
-
-    def draw_header(self, context):
-        self.layout.label(text="", icon="SCULPTMODE_HLT")
-
-    def draw(self, context):
-        layout = self.layout
-        props = context.scene.skv_props
-        obj = getattr(props, "object_pick", None)
-
-        if not obj:
-            layout.label(text="No selected object", icon="INFO")
-            return
-
-        if getattr(obj, "type", None) != "MESH":
-            layout.label(text="Active object is not a mesh", icon="INFO")
-            return
-
-        key_data = get_shape_key_data(obj)
-        quick_keys = _iter_quick_shape_keys(key_data)
-
-        col = layout.column(align=True)
-
-        if props.quick_shape_key_editing:
-            if props.quick_shape_key_name:
-                col.label(text=f"Editing: {props.quick_shape_key_name}")
-            col.operator("skv.quick_shape_key_fix", text="Fix", icon="CHECKMARK")
-        else:
-            col.operator("skv.quick_shape_key_add", text="Add Shape Key", icon="ADD")
-
-        if quick_keys:
-            col.separator()
-
-            header = col.row(align=True)
-            icon = "TRIA_DOWN" if props.quick_keys_open else "TRIA_RIGHT"
-            header.prop(props, "quick_keys_open", text="", emboss=False, icon=icon)
-            header.label(text="Quick Shape Keys")
-
-            if props.quick_keys_open:
-                quick_rows = max(1, min(len(quick_keys), 5))
-                col.template_list(
-                    "SKV_UL_quick_shape_keys",
-                    "",
-                    key_data,
-                    "key_blocks",
-                    props,
-                    "quick_keys_index",
-                    rows=quick_rows,
                 )
 
 
@@ -1035,7 +1122,6 @@ _LOCAL_CLASSES = (
     SKV_Props,
     SKV_PT_ObjectPanel,
     SKV_PT_ShapeKeysPanel,
-    SKV_PT_QuickShapeKeyPanel,
     SKV_PT_PresetsPanel,
 )
 

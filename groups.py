@@ -158,7 +158,7 @@ class SKV_UL_key_blocks(UIList):
         op = row.operator("skv.key_toggle_select", text="", icon=icon_id, emboss=False)
         op.key_index = index
 
-        row.label(text=kb.name)
+        row.prop(kb, "name", text="", emboss=False)
         row.prop(kb, "value", text="", slider=True)
 
         vis_icon = "HIDE_ON" if kb.mute else "HIDE_OFF"
@@ -189,7 +189,7 @@ class SKV_UL_active_keys(UIList):
             kb = None
 
         if kb:
-            row.label(text=kname)
+            row.prop(kb, "name", text="", emboss=False)
             row.prop(kb, "value", text="", slider=True)
 
             vis_icon = "HIDE_ON" if kb.mute else "HIDE_OFF"
