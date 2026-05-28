@@ -38,7 +38,7 @@ from .common import (
 )
 from . import groups
 from . import presets
-from . import meshDataTransfer
+from . import transfer
 
 
 def _poll_mesh_object(self, obj):
@@ -351,7 +351,6 @@ def _auto_process_active_object(scene):
     try:
         previous_name = getattr(props, "last_active_object_name", "")
         previous_signature = getattr(props, "last_shape_key_signature", "")
-        object_changed = previous_name != desired_name
 
         if desired and previous_name == desired_name:
             rename_key_data = get_shape_key_data(desired)
@@ -368,11 +367,8 @@ def _auto_process_active_object(scene):
         props.last_shape_key_signature = desired_signature
         props.object_pick = desired
 
-        # Reset scan status on any object/signature change first.
+        # Reset scan status on any object/signature change.
         props.scan_status = ""
-        # Collapse Active Shape Keys only after object switch; it auto-expands when a key becomes active.
-        if object_changed:
-            props.active_keys_open = False
 
         if not desired:
             tag_redraw_view3d(ctx)
@@ -761,8 +757,8 @@ class SKV_Props(PropertyGroup):
     groups_module_open: BoolProperty(name="Shape Keys", default=True)
     groups_open: BoolProperty(name="Groups", default=True)
     keys_open: BoolProperty(name="Keys", default=True)
-    active_keys_open: BoolProperty(name="Active Shape Keys", default=True)
-    quick_keys_open: BoolProperty(name="Quick Shape Keys", default=True)
+    quick_keys_open: BoolProperty(name="Quick Shape Keys", default=False)
+    active_keys_open: BoolProperty(name="Active Shape Keys", default=False)
     quick_keys_index: IntProperty(name="Quick Shape Keys Index", default=-1, min=-1)
 
     object_pick: PointerProperty(
@@ -784,7 +780,7 @@ class SKV_Props(PropertyGroup):
 
     scan_status: StringProperty(name="Scan Status", default="", options={"SKIP_SAVE"})
 
-    presets_open: BoolProperty(name="Presets", default=False)
+    presets_open: BoolProperty(name="Presets", default=True)
 
     quick_shape_key_editing: BoolProperty(name="Quick Shape Key Editing", default=False)
     quick_shape_key_name: StringProperty(name="Quick Shape Key Name", default="")
@@ -794,6 +790,11 @@ class SKV_Props(PropertyGroup):
         name="Inherit presets",
         default=False,
         description="Add transferred shape keys to the same presets for the target object",
+    )
+    transfer_keyframes_inheritance: BoolProperty(
+        name="Inherit keyframes",
+        default=False,
+        description="Copy keyframes from transferred source shape keys to matching target shape keys",
     )
     move_to_group: EnumProperty(name="Move To", items=enum_groups_for_active_object)
 
@@ -1125,7 +1126,7 @@ _LOCAL_CLASSES = (
     SKV_PT_PresetsPanel,
 )
 
-_ALL_CLASSES = _LOCAL_CLASSES + groups.CLASSES + presets.CLASSES + meshDataTransfer.CLASSES
+_ALL_CLASSES = _LOCAL_CLASSES + groups.CLASSES + presets.CLASSES + transfer.CLASSES
 
 
 def register():
@@ -1153,7 +1154,7 @@ def register():
 
     bpy.types.Key.skv_auto_keyframes = CollectionProperty(type=groups.SKV_AutoKeyframeEntry)
 
-    bpy.types.Object.skv_mesh_data_transfer = PointerProperty(type=meshDataTransfer.SKV_MeshDataSettings)
+    bpy.types.Object.skv_mesh_data_transfer = PointerProperty(type=transfer.SKV_MeshDataSettings)
 
     _ensure_handler_installed()
     try:

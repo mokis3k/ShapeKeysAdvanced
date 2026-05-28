@@ -91,6 +91,338 @@ def _autokf_get_entry(key_data, key_name: str, create: bool = False):
     it.name = key_name
     return it
 
+def _shape_key_value_data_path(key_name: str) -> str:
+    # Build a valid RNA path for a shape key value FCurve.
+    try:
+        escaped = bpy.utils.escape_identifier(key_name)
+    except Exception:
+        escaped = (key_name or "").replace("\\", "\\\\").replace('"', '\\"')
+    return f'key_blocks["{escaped}"].value'
+
+
+def _action_get_slot_for_datablock(action, datablock, create: bool = False):
+    # Return the action slot assigned to the datablock animation data.
+    if not action or not datablock:
+        return None
+
+    anim_data = getattr(datablock, "animation_data", None)
+    slot = getattr(anim_data, "action_slot", None) if anim_data else None
+    if slot:
+        return slot
+
+    slots = getattr(action, "slots", None)
+    if slots is None:
+        return None
+
+    if len(slots) > 0:
+        return slots[0]
+
+    if not create:
+        return None
+
+    try:
+        name = getattr(datablock, "name", "") or "ShapeKeys"
+        slot = action.slots.new(id_type="KEY", name=name)
+    except Exception:
+        return None
+
+    try:
+        if anim_data:
+            anim_data.action_slot = slot
+    except Exception:
+        pass
+
+    return slot
+
+
+def _action_get_channelbag(action, datablock, create: bool = False):
+    # Return an ActionChannelbag for Blender 5.0+ slotted actions.
+    if not action or not datablock:
+        return None
+
+    slot = _action_get_slot_for_datablock(action, datablock, create=create)
+    if not slot:
+        return None
+
+    layers = getattr(action, "layers", None)
+    if layers is None:
+        return None
+
+    if len(layers) > 0:
+        layer = layers[0]
+    elif create:
+        try:
+            layer = layers.new("Layer")
+        except Exception:
+            return None
+    else:
+        return None
+
+    strips = getattr(layer, "strips", None)
+    if strips is None:
+        return None
+
+    if len(strips) > 0:
+        strip = strips[0]
+    elif create:
+        try:
+            strip = strips.new(type="KEYFRAME")
+        except Exception:
+            return None
+    else:
+        return None
+
+    try:
+        return strip.channelbag(slot, ensure=create)
+    except Exception:
+        return None
+
+
+def _iter_action_fcurves(action, datablock):
+    # Yield FCurves from both legacy actions and Blender 5.0+ channelbags.
+    if not action:
+        return
+
+    legacy_fcurves = getattr(action, "fcurves", None)
+    if legacy_fcurves is not None:
+        for fc in legacy_fcurves:
+            yield fc
+        return
+
+    channelbag = _action_get_channelbag(action, datablock, create=False)
+    if not channelbag:
+        return
+
+    for fc in getattr(channelbag, "fcurves", []) or []:
+        yield fc
+
+
+def _action_fcurves_find(action, datablock, data_path: str, index: int = 0):
+    # Find FCurve in both legacy and Blender 5.0+ action APIs.
+    legacy_fcurves = getattr(action, "fcurves", None)
+    if legacy_fcurves is not None:
+        try:
+            return legacy_fcurves.find(data_path, index=index)
+        except Exception:
+            return None
+
+    channelbag = _action_get_channelbag(action, datablock, create=False)
+    if not channelbag:
+        return None
+
+    try:
+        return channelbag.fcurves.find(data_path, index=index)
+    except Exception:
+        return None
+
+
+def _action_fcurves_remove(action, datablock, fcurve) -> None:
+    # Remove FCurve from both legacy and Blender 5.0+ action APIs.
+    if not action or not fcurve:
+        return
+
+    legacy_fcurves = getattr(action, "fcurves", None)
+    if legacy_fcurves is not None:
+        try:
+            legacy_fcurves.remove(fcurve)
+        except Exception:
+            pass
+        return
+
+    channelbag = _action_get_channelbag(action, datablock, create=False)
+    if not channelbag:
+        return
+
+    try:
+        channelbag.fcurves.remove(fcurve)
+    except Exception:
+        pass
+
+
+def _action_fcurves_new(action, datablock, data_path: str, index: int = 0, group_name: str = ""):
+    # Create FCurve in both legacy and Blender 5.0+ action APIs.
+    legacy_fcurves = getattr(action, "fcurves", None)
+    if legacy_fcurves is not None:
+        try:
+            if group_name:
+                return legacy_fcurves.new(data_path=data_path, index=index, action_group=group_name)
+            return legacy_fcurves.new(data_path=data_path, index=index)
+        except Exception:
+            return None
+
+    channelbag = _action_get_channelbag(action, datablock, create=True)
+    if not channelbag:
+        return None
+
+    try:
+        if group_name:
+            return channelbag.fcurves.new(data_path=data_path, index=index, group_name=group_name)
+        return channelbag.fcurves.new(data_path=data_path, index=index)
+    except TypeError:
+        try:
+            if group_name:
+                return channelbag.fcurves.new(data_path=data_path, index=index, action_group=group_name)
+            return channelbag.fcurves.new(data_path=data_path, index=index)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _copy_keyframe_point(dst_kp, src_kp) -> None:
+    # Copy keyframe point settings.
+    try:
+        dst_kp.co = src_kp.co
+    except Exception:
+        pass
+
+    try:
+        dst_kp.handle_left = src_kp.handle_left
+        dst_kp.handle_right = src_kp.handle_right
+    except Exception:
+        pass
+
+    for attr in (
+        "interpolation",
+        "easing",
+        "amplitude",
+        "back",
+        "period",
+        "handle_left_type",
+        "handle_right_type",
+    ):
+        try:
+            setattr(dst_kp, attr, getattr(src_kp, attr))
+        except Exception:
+            pass
+
+
+def _copy_fcurve_keyframes(src_fc, dst_action, dst_datablock, dst_data_path: str) -> bool:
+    # Replace target FCurve keyframes with source FCurve keyframes.
+    if not src_fc or not dst_action or not dst_datablock or not dst_data_path:
+        return False
+
+    try:
+        existing = _action_fcurves_find(
+            dst_action,
+            dst_datablock,
+            dst_data_path,
+            index=int(getattr(src_fc, "array_index", 0)),
+        )
+        if existing:
+            _action_fcurves_remove(dst_action, dst_datablock, existing)
+    except Exception:
+        pass
+
+    group_name = ""
+    try:
+        group_name = src_fc.group.name if src_fc.group else ""
+    except Exception:
+        group_name = ""
+
+    dst_fc = _action_fcurves_new(
+        dst_action,
+        dst_datablock,
+        dst_data_path,
+        index=int(getattr(src_fc, "array_index", 0)),
+        group_name=group_name,
+    )
+    if not dst_fc:
+        return False
+
+    try:
+        dst_fc.extrapolation = src_fc.extrapolation
+    except Exception:
+        pass
+
+    try:
+        dst_fc.color_mode = src_fc.color_mode
+        dst_fc.color = src_fc.color
+    except Exception:
+        pass
+
+    src_points = list(getattr(src_fc, "keyframe_points", []) or [])
+    if not src_points:
+        return True
+
+    try:
+        dst_fc.keyframe_points.add(len(src_points))
+    except Exception:
+        return False
+
+    try:
+        for dst_kp, src_kp in zip(dst_fc.keyframe_points, src_points):
+            _copy_keyframe_point(dst_kp, src_kp)
+        dst_fc.update()
+    except Exception:
+        return False
+
+    return True
+
+
+def inherit_transferred_keyframes(source_obj, target_obj, key_names) -> int:
+    # Copy shape key value keyframes from source to target for transferred keys.
+    if not source_obj or not target_obj or source_obj == target_obj:
+        return 0
+    if getattr(source_obj, "type", None) != "MESH" or getattr(target_obj, "type", None) != "MESH":
+        return 0
+
+    names = [n for n in (key_names or []) if n]
+    if not names:
+        return 0
+
+    source_key_data = get_shape_key_data(source_obj)
+    target_key_data = get_shape_key_data(target_obj)
+
+    if not source_key_data or not target_key_data:
+        return 0
+    if not getattr(source_key_data, "key_blocks", None) or not getattr(target_key_data, "key_blocks", None):
+        return 0
+
+    source_anim = getattr(source_key_data, "animation_data", None)
+    source_action = getattr(source_anim, "action", None) if source_anim else None
+    if not source_action:
+        return 0
+
+    try:
+        target_key_data.animation_data_create()
+    except Exception:
+        return 0
+
+    target_anim = getattr(target_key_data, "animation_data", None)
+    if not target_anim:
+        return 0
+
+    if not target_anim.action:
+        try:
+            target_anim.action = bpy.data.actions.new(name=f"{target_obj.name}_ShapeKeysAction")
+        except Exception:
+            return 0
+
+    target_action = target_anim.action
+    copied = 0
+
+    for key_name in names:
+        if not source_key_data.key_blocks.get(key_name):
+            continue
+        if not target_key_data.key_blocks.get(key_name):
+            continue
+
+        src_path = _shape_key_value_data_path(key_name)
+        dst_path = _shape_key_value_data_path(key_name)
+
+        matched = False
+        for src_fc in _iter_action_fcurves(source_action, source_key_data):
+            if src_fc.data_path != src_path:
+                continue
+
+            if _copy_fcurve_keyframes(src_fc, target_action, target_key_data, dst_path):
+                matched = True
+
+        if matched:
+            copied += 1
+
+    return copied
 
 # -----------------------------
 # UI Lists
@@ -876,6 +1208,7 @@ class SKV_OT_TransferTo(Operator):
         layout = self.layout
         layout.prop(context.scene, "skv_transfer_target", text="Target")
         layout.prop(context.scene.skv_props, "transfer_inheritance", text="Inherit presets")
+        layout.prop(context.scene.skv_props, "transfer_keyframes_inheritance", text="Inherit keyframes")
 
     @classmethod
     def poll(cls, context):
@@ -889,7 +1222,7 @@ class SKV_OT_TransferTo(Operator):
         return any(n != "Basis" for n in selected)
 
     def execute(self, context):
-        from .meshDataTransfer import MeshDataTransfer
+        from .transfer import MeshDataTransfer
         from . import presets
 
         source = get_active_object(context)
@@ -935,6 +1268,9 @@ class SKV_OT_TransferTo(Operator):
         if getattr(context.scene.skv_props, "transfer_inheritance", False):
             inherited_count = presets.inherit_transferred_keys_to_presets(source, target, selected_names)
 
+        if getattr(context.scene.skv_props, "transfer_keyframes_inheritance", False):
+            inherit_transferred_keyframes(source, target, selected_names)
+
         clear_selection_ui(context, key_data)
 
         view_layer = context.view_layer
@@ -979,6 +1315,7 @@ class SKV_OT_TransferFrom(Operator):
         layout = self.layout
         layout.prop(context.scene, "skv_transfer_target", text="Source")
         layout.prop(context.scene.skv_props, "transfer_inheritance", text="Inherit presets")
+        layout.prop(context.scene.skv_props, "transfer_keyframes_inheritance", text="Inherit keyframes")
 
     @classmethod
     def poll(cls, context):
@@ -986,7 +1323,7 @@ class SKV_OT_TransferFrom(Operator):
         return bool(obj and getattr(obj, "type", None) == "MESH")
 
     def execute(self, context):
-        from .meshDataTransfer import MeshDataTransfer
+        from .transfer import MeshDataTransfer
         from . import presets
 
         target = get_active_object(context)
@@ -1007,9 +1344,7 @@ class SKV_OT_TransferFrom(Operator):
             self.report({"ERROR"}, "Source has no Shape Keys")
             return {"CANCELLED"}
 
-        selected_names = [n for n in kd_selected_set(source_key_data) if n != "Basis"]
-        if not selected_names:
-            selected_names = [kb.name for kb in source_key_data.key_blocks if kb.name != "Basis"]
+        selected_names = [kb.name for kb in source_key_data.key_blocks if kb.name != "Basis"]
 
         if not selected_names:
             self.report({"ERROR"}, "Source has no transferable Shape Keys")
@@ -1040,6 +1375,9 @@ class SKV_OT_TransferFrom(Operator):
 
         if getattr(context.scene.skv_props, "transfer_inheritance", False):
             presets.inherit_transferred_keys_to_presets(source, target, selected_names)
+
+        if getattr(context.scene.skv_props, "transfer_keyframes_inheritance", False):
+            inherit_transferred_keyframes(source, target, selected_names)
 
         clear_selection_ui(context, source_key_data)
 

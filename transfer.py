@@ -1,14 +1,3 @@
-# SPDX-License-Identifier: GPL-2.0-or-later
-# Integrated Mesh Data Transfer module (Shape Keys transfer only)
-#
-# Notes:
-# - This module intentionally keeps the original transfer algorithm (BVH + barycentric sampling).
-# - Only the functionality used by this addon UI is retained:
-#   * Search method: Closest
-#   * Space: Local
-#   * Attribute: Shape Keys
-#   * Optional vertex group mask (no invert)
-
 import bpy
 import bmesh
 import numpy as np
