@@ -410,3 +410,153 @@ def preset_apply(preset, context) -> None:
 
 def preset_value_update(self, context):
     preset_apply(self, context)
+
+
+_SKV_SHAPE_KEY_LIST_SYNC_GUARD = False
+
+
+def skv_shape_key_list_sync_active() -> bool:
+    return _SKV_SHAPE_KEY_LIST_SYNC_GUARD
+
+
+def skv_is_quick_shape_key_name(name: str) -> bool:
+    return bool(re.fullmatch(r"Shape Key(?: \d+)?", name or ""))
+
+
+def skv_find_shape_key_index(key_data, key_name: str) -> int:
+    if not key_data or not getattr(key_data, "key_blocks", None) or not key_name:
+        return -1
+
+    for i, kb in enumerate(key_data.key_blocks):
+        if kb.name == key_name:
+            return i
+
+    return -1
+
+
+def skv_get_active_shape_key_name(obj) -> str:
+    if not obj or getattr(obj, "type", None) != "MESH":
+        return ""
+
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return ""
+
+    idx = int(getattr(obj, "active_shape_key_index", -1))
+    if 0 <= idx < len(key_data.key_blocks):
+        return key_data.key_blocks[idx].name
+
+    return ""
+
+
+def skv_set_active_shape_key_by_name(obj, key_name: str) -> bool:
+    if not obj or getattr(obj, "type", None) != "MESH" or not key_name:
+        return False
+
+    key_data = get_shape_key_data(obj)
+    idx = skv_find_shape_key_index(key_data, key_name)
+
+    if idx < 0:
+        return False
+
+    try:
+        obj.active_shape_key_index = idx
+        return True
+    except Exception:
+        return False
+
+
+def skv_sync_shape_key_list_indices(context, obj, key_name: str = "", set_blender_active: bool = True) -> None:
+    """
+    Synchronize active rows of addon UILists from one active shape key name.
+
+    This synchronizes:
+    - Shape Keys in group
+    - Quick Shape Keys
+    - Active Shape Keys
+    - Shape Keys in active preset
+    """
+    global _SKV_SHAPE_KEY_LIST_SYNC_GUARD
+
+    if _SKV_SHAPE_KEY_LIST_SYNC_GUARD:
+        return
+
+    if not context or not obj or getattr(obj, "type", None) != "MESH":
+        return
+
+    scene = getattr(context, "scene", None)
+    props = getattr(scene, "skv_props", None) if scene else None
+    if not props:
+        return
+
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return
+
+    if not key_name:
+        key_name = skv_get_active_shape_key_name(obj)
+
+    if not key_name or skv_find_shape_key_index(key_data, key_name) < 0:
+        if getattr(key_data, "key_blocks", None):
+            key_name = key_data.key_blocks[0].name
+        else:
+            return
+
+    key_index = skv_find_shape_key_index(key_data, key_name)
+    if key_index < 0:
+        return
+
+    _SKV_SHAPE_KEY_LIST_SYNC_GUARD = True
+    try:
+        if set_blender_active or int(getattr(obj, "active_shape_key_index", -1)) < 0:
+            skv_set_active_shape_key_by_name(obj, key_name)
+
+        try:
+            key_group = kd_get_group(key_data, key_name)
+            if hasattr(key_data, "skv_groups") and key_group:
+                for group_index, group in enumerate(key_data.skv_groups):
+                    if group.name == key_group:
+                        key_data.skv_group_index = group_index
+                        break
+        except Exception:
+            pass
+
+        try:
+            props.keys_index = key_index
+        except Exception:
+            pass
+
+        try:
+            props.quick_keys_index = key_index if skv_is_quick_shape_key_name(key_name) else -1
+        except Exception:
+            pass
+
+        try:
+            active_index = -1
+            if hasattr(key_data, "skv_active_keys"):
+                for i, it in enumerate(key_data.skv_active_keys):
+                    if it.name == key_name:
+                        active_index = i
+                        break
+            if hasattr(key_data, "skv_active_keys_index"):
+                key_data.skv_active_keys_index = active_index
+        except Exception:
+            pass
+
+        try:
+            if hasattr(scene, "skv_global_presets") and hasattr(scene, "skv_global_preset_index"):
+                preset_index = int(scene.skv_global_preset_index)
+                if 0 <= preset_index < len(scene.skv_global_presets):
+                    gpreset = scene.skv_global_presets[preset_index]
+                    item_index = -1
+                    for i, it in enumerate(gpreset.items):
+                        if it.object_name == obj.name and it.key_name == key_name:
+                            item_index = i
+                            break
+                    gpreset.items_index = item_index
+        except Exception:
+            pass
+
+        tag_redraw_view3d(context)
+    finally:
+        _SKV_SHAPE_KEY_LIST_SYNC_GUARD = False

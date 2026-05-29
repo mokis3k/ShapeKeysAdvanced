@@ -29,6 +29,8 @@ from .common import (
     count_keys_in_group,
     ensure_init_setup_write,
     InternalValueChangeGuard,
+    skv_shape_key_list_sync_active,
+    skv_sync_shape_key_list_indices,
 )
 
 
@@ -90,6 +92,107 @@ def _autokf_get_entry(key_data, key_name: str, create: bool = False):
     it = key_data.skv_auto_keyframes.add()
     it.name = key_name
     return it
+
+def group_index_update(self, context):
+    # Clear selected shape keys when switching between groups.
+    key_data = self
+    if not key_data or not hasattr(key_data, "skv_selected"):
+        return
+
+    try:
+        key_data.skv_selected.clear()
+    except Exception:
+        pass
+
+    tag_redraw_view3d(context)
+
+def active_keys_index_update(self, context):
+    # Sync Active Shape Keys list selection to all shape key lists.
+    if skv_shape_key_list_sync_active():
+        return
+
+    obj = get_active_object(context)
+    key_data = get_shape_key_data(obj) if obj else None
+    if not obj or not key_data or not hasattr(key_data, "skv_active_keys"):
+        return
+
+    idx = int(getattr(key_data, "skv_active_keys_index", -1))
+    if 0 <= idx < len(key_data.skv_active_keys):
+        key_name = key_data.skv_active_keys[idx].name
+        skv_sync_shape_key_list_indices(
+            context,
+            obj,
+            key_name,
+            set_blender_active=True,
+        )
+
+def _set_object_active_shape_key(obj, key_name: str) -> bool:
+    # Set Blender active shape key by key name.
+    if not obj or getattr(obj, "type", None) != "MESH" or not key_name:
+        return False
+
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return False
+
+    for i, kb in enumerate(key_data.key_blocks):
+        if kb.name == key_name:
+            try:
+                obj.active_shape_key_index = i
+                return True
+            except Exception:
+                return False
+
+    return False
+
+
+def active_keys_index_update(self, context):
+    # Sync Active Shape Keys list selection to all shape key lists.
+    if skv_shape_key_list_sync_active():
+        return
+
+    key_data = self
+    if not key_data or not hasattr(key_data, "skv_active_keys"):
+        return
+
+    idx = int(getattr(key_data, "skv_active_keys_index", -1))
+    if idx < 0 or idx >= len(key_data.skv_active_keys):
+        return
+
+    key_name = key_data.skv_active_keys[idx].name
+    if not key_name:
+        return
+
+    obj = None
+
+    # Prefer current addon-picked object if it owns this Key datablock.
+    try:
+        props = getattr(context.scene, "skv_props", None)
+        picked = getattr(props, "object_pick", None) if props else None
+        if picked and get_shape_key_data(picked) is key_data:
+            obj = picked
+    except Exception:
+        obj = None
+
+    # Fallback: find mesh object that owns this Key datablock.
+    if obj is None:
+        try:
+            for candidate in bpy.data.objects:
+                if getattr(candidate, "type", None) == "MESH" and get_shape_key_data(candidate) is key_data:
+                    obj = candidate
+                    break
+        except Exception:
+            obj = None
+
+    if not obj:
+        return
+
+    skv_sync_shape_key_list_indices(
+        context,
+        obj,
+        key_name,
+        set_blender_active=True,
+    )
 
 def _shape_key_value_data_path(key_name: str) -> str:
     # Build a valid RNA path for a shape key value FCurve.

@@ -11,6 +11,8 @@ from .common import (
     ensure_init_setup_write,
     kd_selected_set,
     _is_basis_name,
+    skv_shape_key_list_sync_active,
+    skv_sync_shape_key_list_indices,
 )
 
 _PRESET_ITEM_SYNC_GUARD = False
@@ -321,6 +323,41 @@ def inherit_transferred_keys_to_presets(source_obj, target_obj, key_names) -> in
     return inherited_count
 
 
+def global_preset_items_index_update(self, context):
+    # Sync Shape Keys in preset list selection to all shape key lists.
+    if skv_shape_key_list_sync_active():
+        return
+
+    idx = int(getattr(self, "items_index", -1))
+    if idx < 0 or idx >= len(self.items):
+        return
+
+    it = self.items[idx]
+    obj = bpy.data.objects.get(it.object_name) if it.object_name else None
+    if not obj or getattr(obj, "type", None) != "MESH":
+        return
+
+    try:
+        for ob in context.view_layer.objects:
+            if ob.select_get():
+                ob.select_set(False)
+    except Exception:
+        pass
+
+    try:
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        context.scene.skv_props.object_pick = obj
+    except Exception:
+        pass
+
+    skv_sync_shape_key_list_indices(
+        context,
+        obj,
+        it.key_name,
+        set_blender_active=True,
+    )
+
 class SKV_GlobalPresetItem(PropertyGroup):
     object_name: StringProperty(name="Object", default="")
     key_name: StringProperty(name="Shape Key", default="")
@@ -338,6 +375,75 @@ class SKV_GlobalPresetItem(PropertyGroup):
     )
 
 
+def _set_object_active_shape_key(obj, key_name: str) -> bool:
+    # Set Blender active shape key by key name.
+    if not obj or getattr(obj, "type", None) != "MESH" or not key_name:
+        return False
+
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return False
+
+    for i, kb in enumerate(key_data.key_blocks):
+        if kb.name == key_name:
+            try:
+                obj.active_shape_key_index = i
+                return True
+            except Exception:
+                return False
+
+    return False
+
+
+def global_preset_items_index_update(self, context):
+    # Sync Shape Keys in preset list selection to all shape key lists.
+    if skv_shape_key_list_sync_active():
+        return
+
+    gpreset = self
+
+    idx = int(getattr(gpreset, "items_index", -1))
+    if idx < 0 or idx >= len(gpreset.items):
+        return
+
+    it = gpreset.items[idx]
+    obj = bpy.data.objects.get(it.object_name) if it.object_name else None
+    if not obj or getattr(obj, "type", None) != "MESH":
+        return
+
+    key_name = (it.key_name or "").strip()
+    if not key_name:
+        return
+
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return
+
+    if not key_data.key_blocks.get(key_name):
+        return
+
+    try:
+        for ob in context.view_layer.objects:
+            if ob.select_get():
+                ob.select_set(False)
+    except Exception:
+        pass
+
+    try:
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        context.scene.skv_props.object_pick = obj
+    except Exception:
+        pass
+
+    skv_sync_shape_key_list_indices(
+        context,
+        obj,
+        key_name,
+        set_blender_active=True,
+    )
+
+
 class SKV_GlobalPreset(PropertyGroup):
     name: StringProperty(name="Preset Name", default="Preset")
     value: FloatProperty(
@@ -348,7 +454,12 @@ class SKV_GlobalPreset(PropertyGroup):
         update=global_preset_value_update,
     )
     items: CollectionProperty(type=SKV_GlobalPresetItem)
-    items_index: IntProperty(name="Items Index", default=-1, min=-1)
+    items_index: IntProperty(
+        name="Items Index",
+        default=-1,
+        min=-1,
+        update=global_preset_items_index_update,
+    )
 
 
 class SKV_OT_preset_capture_max_index(Operator):

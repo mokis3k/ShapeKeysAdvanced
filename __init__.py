@@ -28,6 +28,7 @@ from .common import (
     is_initialized,
     get_selected_group_name,
     count_keys_in_group,
+    count_selected_in_group,
     tag_redraw_view3d,
     INIT_GROUP_NAME,
     kd_selected_set,
@@ -35,6 +36,8 @@ from .common import (
     kd_set_selected,
     kd_clear_selected,
     is_internal_value_change,
+    skv_shape_key_list_sync_active,
+    skv_sync_shape_key_list_indices,
 )
 from . import groups
 from . import presets
@@ -55,7 +58,7 @@ def _poll_transfer_target(scene, obj):
 
 
 def _is_quick_shape_key_name(name: str) -> bool:
-    return bool(re.fullmatch(r"Shape Key(?: \d+)?", name or ""))
+    return bool(re.fullmatch(r"Quick Key(?: \d+)?", name or ""))
 
 
 def _iter_quick_shape_keys(key_data):
@@ -66,16 +69,16 @@ def _iter_quick_shape_keys(key_data):
 
 def _next_quick_shape_key_name(key_data) -> str:
     if not key_data or not getattr(key_data, "key_blocks", None):
-        return "Shape Key"
+        return "Quick Key"
 
     existing = {kb.name for kb in key_data.key_blocks}
-    if "Shape Key" not in existing:
-        return "Shape Key"
+    if "Quick Key" not in existing:
+        return "Quick Key"
 
     index = 1
-    while f"Shape Key {index}" in existing:
+    while f"Quick Key {index}" in existing:
         index += 1
-    return f"Shape Key {index}"
+    return f"Quick Key {index}"
 
 
 # -----------------------------
@@ -351,6 +354,7 @@ def _auto_process_active_object(scene):
     try:
         previous_name = getattr(props, "last_active_object_name", "")
         previous_signature = getattr(props, "last_shape_key_signature", "")
+        object_changed = previous_name != desired_name
 
         if desired and previous_name == desired_name:
             rename_key_data = get_shape_key_data(desired)
@@ -395,6 +399,26 @@ def _auto_process_active_object(scene):
 
         # (Re)build defaults snapshot on first run or if mismatched.
         _defaults_ensure(key_data)
+
+        if object_changed:
+            basis_name = ""
+            try:
+                if getattr(key_data, "key_blocks", None):
+                    basis_name = key_data.key_blocks[0].name
+            except Exception:
+                basis_name = ""
+
+            if basis_name:
+                skv_sync_shape_key_list_indices(
+                    ctx,
+                    desired,
+                    basis_name,
+                    set_blender_active=True,
+                )
+            else:
+                skv_sync_shape_key_list_indices(ctx, desired, set_blender_active=False)
+        else:
+            skv_sync_shape_key_list_indices(ctx, desired, set_blender_active=False)
 
         tag_redraw_view3d(ctx)
     finally:
@@ -750,8 +774,157 @@ def transfer_open_update(self, context):
 #     tag_redraw_view3d(context)
 
 
+def _sync_shape_key_list_indices(context, obj, key_data=None) -> None:
+    # Sync UI list active rows from Blender active shape key.
+    props = getattr(context.scene, "skv_props", None) if context else None
+    if not props or not obj:
+        return
+
+    if key_data is None:
+        key_data = get_shape_key_data(obj)
+
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return
+
+    active_name = _get_object_active_shape_key_name(obj)
+    if not active_name:
+        return
+
+    for i, kb in enumerate(key_data.key_blocks):
+        if kb.name == active_name:
+            try:
+                props.keys_index = i
+            except Exception:
+                pass
+
+            try:
+                if _is_quick_shape_key_name(kb.name):
+                    props.quick_keys_index = i
+            except Exception:
+                pass
+
+            break
+
+    try:
+        for i, it in enumerate(key_data.skv_active_keys):
+            if it.name == active_name:
+                key_data.skv_active_keys_index = i
+                break
+    except Exception:
+        pass
+
+
+def _set_object_active_shape_key(obj, key_name: str) -> bool:
+    # Set Blender active shape key by key name.
+    if not obj or getattr(obj, "type", None) != "MESH" or not key_name:
+        return False
+
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return False
+
+    for i, kb in enumerate(key_data.key_blocks):
+        if kb.name == key_name:
+            try:
+                obj.active_shape_key_index = i
+                return True
+            except Exception:
+                return False
+
+    return False
+
+
+def _get_object_active_shape_key_name(obj) -> str:
+    # Return the current Blender active shape key name.
+    if not obj or getattr(obj, "type", None) != "MESH":
+        return ""
+
+    key_data = get_shape_key_data(obj)
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return ""
+
+    idx = int(getattr(obj, "active_shape_key_index", -1))
+    if 0 <= idx < len(key_data.key_blocks):
+        return key_data.key_blocks[idx].name
+
+    return ""
+
+
+def keys_index_update(self, context):
+    # Sync Shape Keys in group list selection to Blender active shape key.
+    obj = getattr(self, "object_pick", None)
+    key_data = get_shape_key_data(obj) if obj else None
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return
+
+    idx = int(getattr(self, "keys_index", -1))
+    if 0 <= idx < len(key_data.key_blocks):
+        _set_object_active_shape_key(obj, key_data.key_blocks[idx].name)
+        tag_redraw_view3d(context)
+
+
+def quick_keys_index_update(self, context):
+    # Sync Quick Shape Keys list selection to Blender active shape key.
+    obj = getattr(self, "object_pick", None)
+    key_data = get_shape_key_data(obj) if obj else None
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return
+
+    idx = int(getattr(self, "quick_keys_index", -1))
+    if 0 <= idx < len(key_data.key_blocks):
+        kb = key_data.key_blocks[idx]
+        if _is_quick_shape_key_name(kb.name):
+            _set_object_active_shape_key(obj, kb.name)
+            tag_redraw_view3d(context)
+
+
+def keys_index_update(self, context):
+    # Sync Shape Keys in group list selection to all shape key lists.
+    if skv_shape_key_list_sync_active():
+        return
+
+    obj = getattr(self, "object_pick", None)
+    key_data = get_shape_key_data(obj) if obj else None
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return
+
+    idx = int(getattr(self, "keys_index", -1))
+    if 0 <= idx < len(key_data.key_blocks):
+        skv_sync_shape_key_list_indices(
+            context,
+            obj,
+            key_data.key_blocks[idx].name,
+            set_blender_active=True,
+        )
+
+
+def quick_keys_index_update(self, context):
+    # Sync Quick Shape Keys list selection to all shape key lists.
+    if skv_shape_key_list_sync_active():
+        return
+
+    obj = getattr(self, "object_pick", None)
+    key_data = get_shape_key_data(obj) if obj else None
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return
+
+    idx = int(getattr(self, "quick_keys_index", -1))
+    if 0 <= idx < len(key_data.key_blocks):
+        skv_sync_shape_key_list_indices(
+            context,
+            obj,
+            key_data.key_blocks[idx].name,
+            set_blender_active=True,
+        )
+
+
 class SKV_Props(PropertyGroup):
-    keys_index: IntProperty(name="Keys Index", default=-1, min=-1)
+    keys_index: IntProperty(
+        name="Keys Index",
+        default=-1,
+        min=-1,
+        update=keys_index_update,
+    )
     search: StringProperty(name="Search", default="")
 
     groups_module_open: BoolProperty(name="Shape Keys", default=True)
@@ -759,7 +932,12 @@ class SKV_Props(PropertyGroup):
     keys_open: BoolProperty(name="Keys", default=True)
     quick_keys_open: BoolProperty(name="Quick Shape Keys", default=False)
     active_keys_open: BoolProperty(name="Active Shape Keys", default=False)
-    quick_keys_index: IntProperty(name="Quick Shape Keys Index", default=-1, min=-1)
+    quick_keys_index: IntProperty(
+        name="Quick Shape Keys Index",
+        default=-1,
+        min=-1,
+        update=quick_keys_index_update,
+    )
 
     object_pick: PointerProperty(
         name="Object",
@@ -985,8 +1163,11 @@ class SKV_PT_ShapeKeysPanel(Panel):
             #     row.prop(props, "affix_type", text="")
             #     row.prop(props, "affix_value", text="", icon="FILTER")
 
-            if has_selected_valid and group_count > 0:
-                keys_col.separator()
+            selected_count = count_selected_in_group(key_data, current_group, getattr(props, "search", ""))
+
+            if selected_count > 0 and group_count > 0:
+                # keys_col.separator()
+                # keys_col.label(text=f"Selected: {selected_count}")
 
                 r1 = keys_col.row(align=True)
                 r1m = r1.row(align=True)
@@ -1142,7 +1323,12 @@ def register():
     bpy.types.Scene.skv_transfer_target = PointerProperty(type=bpy.types.Object, poll=_poll_transfer_target)
 
     bpy.types.Key.skv_groups = CollectionProperty(type=groups.SKV_Group)
-    bpy.types.Key.skv_group_index = IntProperty(name="Group Index", default=0, min=0)
+    bpy.types.Key.skv_group_index = IntProperty(
+        name="Group Index",
+        default=0,
+        min=0,
+        update=groups.group_index_update,
+    )
 
     bpy.types.Key.skv_selected = CollectionProperty(type=groups.SKV_SelectedName)
     bpy.types.Key.skv_key_groups = CollectionProperty(type=groups.SKV_KeyGroupEntry)
@@ -1150,7 +1336,12 @@ def register():
     bpy.types.Key.skv_key_defaults = CollectionProperty(type=groups.SKV_KeyDefaultEntry)
 
     bpy.types.Key.skv_active_keys = CollectionProperty(type=groups.SKV_ActiveKeyEntry)
-    bpy.types.Key.skv_active_keys_index = IntProperty(name="Active Keys Index", default=-1, min=-1)
+    bpy.types.Key.skv_active_keys_index = IntProperty(
+        name="Active Keys Index",
+        default=-1,
+        min=-1,
+        update=groups.active_keys_index_update,
+    )
 
     bpy.types.Key.skv_auto_keyframes = CollectionProperty(type=groups.SKV_AutoKeyframeEntry)
 
