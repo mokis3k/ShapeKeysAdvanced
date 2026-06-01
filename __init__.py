@@ -57,6 +57,14 @@ def _poll_transfer_target(scene, obj):
     return (not src_name) or (obj.name != src_name)
 
 
+def _poll_sync_values_source(scene, obj):
+    # Accept only mesh objects and exclude the current target mesh.
+    if not obj or getattr(obj, "type", None) != "MESH":
+        return False
+    target_name = getattr(scene, "skv_sync_values_target_name", "")
+    return (not target_name) or (obj.name != target_name)
+
+
 def _is_quick_shape_key_name(name: str) -> bool:
     return bool(re.fullmatch(r"Quick Key(?: \d+)?", name or ""))
 
@@ -534,6 +542,100 @@ class SKV_OT_SearchClear(Operator):
             context.scene.skv_props.search = ""
             context.scene.skv_props.keys_index = -1
         tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+
+class SKV_OT_SynchronizeValues(Operator):
+    bl_idname = "skv.synchronize_values"
+    bl_label = "Synchronize values"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        props = getattr(context.scene, "skv_props", None) if hasattr(context, "scene") else None
+        obj = getattr(props, "object_pick", None) if props else None
+        return bool(obj and getattr(obj, "type", None) == "MESH")
+
+    def invoke(self, context, event):
+        props = context.scene.skv_props
+        target = getattr(props, "object_pick", None)
+
+        if not target or getattr(target, "type", None) != "MESH":
+            return {"CANCELLED"}
+
+        context.scene.skv_sync_values_target_name = target.name
+
+        source = getattr(context.scene, "skv_sync_values_source", None)
+        if not source or getattr(source, "type", None) != "MESH" or source.name == target.name:
+            context.scene.skv_sync_values_source = None
+
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(context.scene, "skv_sync_values_source", text="Source")
+
+    def execute(self, context):
+        from .common import InternalValueChangeGuard
+
+        target_name = getattr(context.scene, "skv_sync_values_target_name", "")
+        target = bpy.data.objects.get(target_name) if target_name else None
+
+        if not target or getattr(target, "type", None) != "MESH":
+            props = getattr(context.scene, "skv_props", None)
+            target = getattr(props, "object_pick", None) if props else None
+
+        if not target or getattr(target, "type", None) != "MESH":
+            self.report({"ERROR"}, "Target mesh is not set")
+            return {"CANCELLED"}
+
+        source = getattr(context.scene, "skv_sync_values_source", None)
+        if not source or getattr(source, "type", None) != "MESH":
+            self.report({"ERROR"}, "Source mesh is not set")
+            return {"CANCELLED"}
+
+        if source.name == target.name:
+            self.report({"ERROR"}, "Source must be different from target")
+            return {"CANCELLED"}
+
+        source_key_data = get_shape_key_data(source)
+        target_key_data = get_shape_key_data(target)
+
+        if not source_key_data or not getattr(source_key_data, "key_blocks", None):
+            self.report({"ERROR"}, "Source has no Shape Keys")
+            return {"CANCELLED"}
+
+        if not target_key_data or not getattr(target_key_data, "key_blocks", None):
+            self.report({"ERROR"}, "Target has no Shape Keys")
+            return {"CANCELLED"}
+
+        if getattr(target_key_data, "library", None) is not None:
+            self.report({"ERROR"}, "Target shape key datablock is linked (read-only).")
+            return {"CANCELLED"}
+
+        changed = 0
+
+        with InternalValueChangeGuard():
+            for src_kb in source_key_data.key_blocks:
+                if src_kb.name == "Basis":
+                    continue
+
+                dst_kb = target_key_data.key_blocks.get(src_kb.name)
+                if not dst_kb:
+                    continue
+
+                try:
+                    dst_kb.value = float(src_kb.value)
+                    changed += 1
+                except Exception:
+                    continue
+
+        if changed == 0:
+            self.report({"INFO"}, "No matching Shape Keys found")
+            return {"CANCELLED"}
+
+        tag_redraw_view3d(context)
+        self.report({"INFO"}, f"Synchronized values: {changed}")
         return {"FINISHED"}
 
 
@@ -1061,6 +1163,9 @@ class SKV_PT_ObjectPanel(Panel):
         row = layout.row(align=True)
         row.label(text=obj.name if obj else "No selected object", icon="MESH_DATA")
 
+        if obj:
+            row.operator("skv.synchronize_values", text="Synchronize values", icon="FILE_REFRESH")
+
 
 class SKV_PT_ShapeKeysPanel(Panel):
     bl_label = "Shape Keys"
@@ -1298,6 +1403,7 @@ class SKV_PT_PresetsPanel(Panel):
 _LOCAL_CLASSES = (
     SKV_UL_quick_shape_keys,
     SKV_OT_SearchClear,
+    SKV_OT_SynchronizeValues,
     SKV_OT_QuickShapeKeyAdd,
     SKV_OT_QuickShapeKeyDelete,
     SKV_OT_QuickShapeKeyFix,
@@ -1322,12 +1428,25 @@ def register():
     bpy.types.Scene.skv_transfer_source_name = StringProperty(options={"SKIP_SAVE"})
     bpy.types.Scene.skv_transfer_target = PointerProperty(type=bpy.types.Object, poll=_poll_transfer_target)
 
+    bpy.types.Scene.skv_sync_values_target_name = StringProperty(options={"SKIP_SAVE"})
+    bpy.types.Scene.skv_sync_values_source = PointerProperty(
+        type=bpy.types.Object,
+        poll=_poll_sync_values_source,
+    )
+
+
     bpy.types.Key.skv_groups = CollectionProperty(type=groups.SKV_Group)
     bpy.types.Key.skv_group_index = IntProperty(
         name="Group Index",
         default=0,
         min=0,
         update=groups.group_index_update,
+    )
+    bpy.types.Key.skv_last_group_index = IntProperty(
+        name="Last Group Index",
+        default=0,
+        min=0,
+        options={"SKIP_SAVE"},
     )
 
     bpy.types.Key.skv_selected = CollectionProperty(type=groups.SKV_SelectedName)
@@ -1373,8 +1492,15 @@ def unregister():
 
     del bpy.types.Key.skv_key_groups
     del bpy.types.Key.skv_selected
+    if hasattr(bpy.types.Key, "skv_last_group_index"):
+        del bpy.types.Key.skv_last_group_index
     del bpy.types.Key.skv_groups
     del bpy.types.Key.skv_group_index
+
+    if hasattr(bpy.types.Scene, "skv_sync_values_source"):
+        del bpy.types.Scene.skv_sync_values_source
+    if hasattr(bpy.types.Scene, "skv_sync_values_target_name"):
+        del bpy.types.Scene.skv_sync_values_target_name
 
     if hasattr(bpy.types.Scene, "skv_transfer_target"):
         del bpy.types.Scene.skv_transfer_target

@@ -49,11 +49,164 @@ def _make_unique_name(base_name: str, existing_names) -> str:
     return f"{base} {index}"
 
 
+def _make_transfer_group_name(source_group_name: str, source_obj, target_key_data) -> str:
+    # Build target group name for transferred shape keys.
+    base_name = (source_group_name or INIT_GROUP_NAME).strip() or INIT_GROUP_NAME
+    source_name = getattr(source_obj, "name", "") if source_obj else ""
+    target_base_name = f"{base_name} ({source_name})" if source_name else base_name
+
+    return _make_unique_name(target_base_name, group_names(target_key_data))
+
+
+def _ensure_group_exists(key_data, group_name: str) -> bool:
+    # Ensure that a group with the given name exists in target key data.
+    if not key_data or not has_group_storage(key_data):
+        return False
+
+    group_name = (group_name or INIT_GROUP_NAME).strip() or INIT_GROUP_NAME
+
+    for g in key_data.skv_groups:
+        if g.name == group_name:
+            return True
+
+    try:
+        g = key_data.skv_groups.add()
+        g.name = group_name
+        try:
+            g.last_name = group_name
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def inherit_transferred_groups(source_obj, target_obj, key_names) -> int:
+    # Copy source group mapping to target for transferred shape keys.
+    if not source_obj or not target_obj or source_obj == target_obj:
+        return 0
+    if getattr(source_obj, "type", None) != "MESH" or getattr(target_obj, "type", None) != "MESH":
+        return 0
+
+    names = [n for n in (key_names or []) if n and n != "Basis"]
+    if not names:
+        return 0
+
+    source_key_data = get_shape_key_data(source_obj)
+    target_key_data = get_shape_key_data(target_obj)
+
+    if not source_key_data or not target_key_data:
+        return 0
+    if not getattr(source_key_data, "key_blocks", None) or not getattr(target_key_data, "key_blocks", None):
+        return 0
+    if not has_group_storage(source_key_data) or not has_group_storage(target_key_data):
+        return 0
+    if getattr(target_key_data, "library", None) is not None:
+        return 0
+
+    ensure_init_setup_write(target_obj)
+
+    source_to_target_group = {}
+    changed = 0
+
+    for key_name in names:
+        if not source_key_data.key_blocks.get(key_name):
+            continue
+        if not target_key_data.key_blocks.get(key_name):
+            continue
+
+        source_group = kd_get_group(source_key_data, key_name)
+
+        if source_group not in source_to_target_group:
+            target_group = _make_transfer_group_name(source_group, source_obj, target_key_data)
+            if not _ensure_group_exists(target_key_data, target_group):
+                continue
+            source_to_target_group[source_group] = target_group
+
+        kd_set_group(target_key_data, key_name, source_to_target_group[source_group])
+        changed += 1
+
+    ensure_init_setup_write(target_obj)
+    return changed
+
+
 # -----------------------------
 # Data Model (groups + selection + group mapping)
 # -----------------------------
+
+def group_name_update(self, context):
+    # Keep shape key -> group mapping synchronized after inline group rename.
+    key_data = getattr(self, "id_data", None)
+    if not key_data or not has_group_storage(key_data):
+        return
+
+    old_name = (getattr(self, "last_name", "") or "").strip()
+    new_name = (getattr(self, "name", "") or "").strip()
+
+    if not new_name:
+        try:
+            self.name = old_name or "Group"
+        except Exception:
+            pass
+        return
+
+    if not old_name:
+        try:
+            self.last_name = new_name
+        except Exception:
+            pass
+        return
+
+    if old_name == new_name:
+        return
+
+    # Prevent duplicate group names on inline rename.
+    try:
+        duplicate = False
+        for g in key_data.skv_groups:
+            if g == self:
+                continue
+            if g.name == new_name:
+                duplicate = True
+                break
+
+        if duplicate:
+            self.name = old_name
+            return
+    except Exception:
+        pass
+
+    if old_name == INIT_GROUP_NAME:
+        try:
+            self.name = old_name
+        except Exception:
+            pass
+        return
+
+    if getattr(key_data, "library", None) is not None:
+        try:
+            self.name = old_name
+        except Exception:
+            pass
+        return
+
+    try:
+        for kb in key_data.key_blocks:
+            if kd_get_group(key_data, kb.name) == old_name:
+                kd_set_group(key_data, kb.name, new_name)
+    except Exception:
+        pass
+
+    try:
+        self.last_name = new_name
+    except Exception:
+        pass
+
+    tag_redraw_view3d(context)
+
 class SKV_Group(PropertyGroup):
-    name: StringProperty(name="Name", default="Group")
+    name: StringProperty(name="Name", default="Group", update=group_name_update)
+    last_name: StringProperty(name="Last Name", default="", options={"SKIP_SAVE"})
 
 
 class SKV_SelectedName(PropertyGroup):
@@ -94,10 +247,21 @@ def _autokf_get_entry(key_data, key_name: str, create: bool = False):
     return it
 
 def group_index_update(self, context):
-    # Clear selected shape keys when switching between groups.
+    # Clear selected shape keys only when the active group index actually changes.
     key_data = self
     if not key_data or not hasattr(key_data, "skv_selected"):
         return
+
+    current_index = int(getattr(key_data, "skv_group_index", 0))
+    previous_index = int(getattr(key_data, "skv_last_group_index", -1))
+
+    if current_index == previous_index:
+        return
+
+    try:
+        key_data.skv_last_group_index = current_index
+    except Exception:
+        pass
 
     try:
         key_data.skv_selected.clear()
@@ -536,6 +700,12 @@ class SKV_UL_Groups(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         g = item
         key_data = data
+
+        try:
+            if not getattr(g, "last_name", ""):
+                g.last_name = g.name
+        except Exception:
+            pass
 
         row = layout.row(align=True)
         if g.name == INIT_GROUP_NAME:
@@ -1100,6 +1270,7 @@ class SKV_OT_GroupAdd(Operator):
 
         g = key_data.skv_groups.add()
         g.name = new_name
+        g.last_name = new_name
 
         if 0 <= prev_idx < len(key_data.skv_groups):
             key_data.skv_group_index = prev_idx
@@ -1208,6 +1379,7 @@ class SKV_OT_GroupRename(Operator):
             return {"CANCELLED"}
 
         key_data.skv_groups[idx].name = new
+        key_data.skv_groups[idx].last_name = new
 
         for kb in key_data.key_blocks:
             if kd_get_group(key_data, kb.name) == old:
@@ -1266,6 +1438,7 @@ class SKV_OT_CreateGroupFromSelected(Operator):
 
         g = key_data.skv_groups.add()
         g.name = new_name
+        g.last_name = new_name
 
         if 0 <= prev_idx < len(key_data.skv_groups):
             key_data.skv_group_index = prev_idx
@@ -1366,6 +1539,8 @@ class SKV_OT_TransferTo(Operator):
                         dst_kb.value = float(src_kb.value)
                     except Exception:
                         pass
+
+        inherit_transferred_groups(source, target, selected_names)
 
         inherited_count = 0
         if getattr(context.scene.skv_props, "transfer_inheritance", False):
@@ -1475,6 +1650,8 @@ class SKV_OT_TransferFrom(Operator):
                         dst_kb.value = float(src_kb.value)
                     except Exception:
                         pass
+
+        inherit_transferred_groups(source, target, selected_names)
 
         if getattr(context.scene.skv_props, "transfer_inheritance", False):
             presets.inherit_transferred_keys_to_presets(source, target, selected_names)
