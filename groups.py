@@ -14,6 +14,7 @@ from .common import (
     get_shape_key_data,
     has_group_storage,
     group_names,
+    get_fallback_group_name,
     is_initialized,
     get_selected_group_name,
     enum_groups_for_active_object,
@@ -50,12 +51,17 @@ def _make_unique_name(base_name: str, existing_names) -> str:
 
 
 def _make_transfer_group_name(source_group_name: str, source_obj, target_key_data) -> str:
-    # Build target group name for transferred shape keys.
+    # Build deterministic target group name for transferred shape keys.
+    # Reuse it if it already exists on target.
     base_name = (source_group_name or INIT_GROUP_NAME).strip() or INIT_GROUP_NAME
     source_name = getattr(source_obj, "name", "") if source_obj else ""
-    target_base_name = f"{base_name} ({source_name})" if source_name else base_name
+    transfer_name = f"{base_name} ({source_name})" if source_name else base_name
 
-    return _make_unique_name(target_base_name, group_names(target_key_data))
+    existing = set(group_names(target_key_data))
+    if transfer_name in existing:
+        return transfer_name
+
+    return _make_unique_name(transfer_name, existing)
 
 
 def _ensure_group_exists(key_data, group_name: str) -> bool:
@@ -79,6 +85,20 @@ def _ensure_group_exists(key_data, group_name: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _filter_existing_target_shape_keys(target_obj, key_names):
+    # Return only shape keys that do not already exist on target.
+    target_key_data = get_shape_key_data(target_obj)
+    if not target_key_data or not getattr(target_key_data, "key_blocks", None):
+        return [n for n in (key_names or []) if n and n != "Basis"]
+
+    existing = {kb.name for kb in target_key_data.key_blocks}
+    return [
+        n
+        for n in (key_names or [])
+        if n and n != "Basis" and n not in existing
+    ]
 
 
 def inherit_transferred_groups(source_obj, target_obj, key_names) -> int:
@@ -127,7 +147,51 @@ def inherit_transferred_groups(source_obj, target_obj, key_names) -> int:
         changed += 1
 
     ensure_init_setup_write(target_obj)
+    _remove_empty_transfer_fallback_group(target_key_data)
     return changed
+
+
+def _remove_empty_transfer_fallback_group(target_key_data) -> None:
+    # Remove the auto-created fallback group if transferred groups already exist
+    # and the fallback group has no non-Basis shape keys assigned to it.
+    if not target_key_data or not has_group_storage(target_key_data):
+        return
+
+    groups = getattr(target_key_data, "skv_groups", None)
+    if not groups or len(groups) <= 1:
+        return
+
+    fallback_index = -1
+    for i, g in enumerate(groups):
+        if g.name == INIT_GROUP_NAME:
+            fallback_index = i
+            break
+
+    if fallback_index < 0:
+        return
+
+    for kb in getattr(target_key_data, "key_blocks", []) or []:
+        if kb.name == "Basis":
+            continue
+        if kd_get_group(target_key_data, kb.name) == INIT_GROUP_NAME:
+            return
+
+    try:
+        groups.remove(fallback_index)
+    except Exception:
+        return
+
+    try:
+        if target_key_data.skv_group_index >= len(groups):
+            target_key_data.skv_group_index = max(0, len(groups) - 1)
+    except Exception:
+        pass
+
+    try:
+        if hasattr(target_key_data, "skv_last_group_index"):
+            target_key_data.skv_last_group_index = int(target_key_data.skv_group_index)
+    except Exception:
+        pass
 
 
 # -----------------------------
@@ -176,12 +240,6 @@ def group_name_update(self, context):
     except Exception:
         pass
 
-    if old_name == INIT_GROUP_NAME:
-        try:
-            self.name = old_name
-        except Exception:
-            pass
-        return
 
     if getattr(key_data, "library", None) is not None:
         try:
@@ -708,10 +766,7 @@ class SKV_UL_Groups(UIList):
             pass
 
         row = layout.row(align=True)
-        if g.name == INIT_GROUP_NAME:
-            row.label(text=g.name, icon="FILE_FOLDER")
-        else:
-            row.prop(g, "name", text="", emboss=False, icon="FILE_FOLDER")
+        row.prop(g, "name", text="", emboss=False, icon="FILE_FOLDER")
         try:
             cnt = count_keys_in_group(key_data, g.name)
         except Exception:
@@ -739,7 +794,10 @@ class SKV_UL_key_blocks(UIList):
         for kb in getattr(key_data, propname):
             ok = True
 
-            if group_name:
+            if kb.name == "Basis":
+                ok = False
+
+            if ok and group_name:
                 if kd_get_group(key_data, kb.name) != group_name:
                     ok = False
 
@@ -1304,18 +1362,34 @@ class SKV_OT_GroupRemove(Operator):
         if not (0 <= idx < len(key_data.skv_groups)):
             return {"CANCELLED"}
 
-        name = key_data.skv_groups[idx].name
-        if name == INIT_GROUP_NAME:
-            self.report({"WARNING"}, "Cannot remove 'Main' group.")
+        if len(key_data.skv_groups) <= 1:
+            self.report({"WARNING"}, "Object must have at least one group.")
             return {"CANCELLED"}
 
+        removed_name = key_data.skv_groups[idx].name
+
+        fallback_name = ""
+        for i, g in enumerate(key_data.skv_groups):
+            if i != idx:
+                fallback_name = g.name
+                break
+
+        fallback_name = fallback_name or get_fallback_group_name(key_data)
+
         for kb in key_data.key_blocks:
-            if kd_get_group(key_data, kb.name) == name:
-                kd_set_group(key_data, kb.name, INIT_GROUP_NAME)
+            if kd_get_group(key_data, kb.name) == removed_name:
+                kd_set_group(key_data, kb.name, fallback_name)
 
         key_data.skv_groups.remove(idx)
+
         if key_data.skv_group_index >= len(key_data.skv_groups):
             key_data.skv_group_index = max(0, len(key_data.skv_groups) - 1)
+
+        try:
+            if hasattr(key_data, "skv_last_group_index"):
+                key_data.skv_last_group_index = int(key_data.skv_group_index)
+        except Exception:
+            pass
 
         ensure_init_setup_write(obj)
         tag_redraw_view3d(context)
@@ -1364,9 +1438,6 @@ class SKV_OT_GroupRename(Operator):
             return {"CANCELLED"}
 
         old = key_data.skv_groups[idx].name
-        if old == INIT_GROUP_NAME:
-            self.report({"WARNING"}, "Cannot rename 'Main' group.")
-            return {"CANCELLED"}
 
         new = self.new_name.strip()
         if not new:
@@ -1520,6 +1591,11 @@ class SKV_OT_TransferTo(Operator):
             self.report({"ERROR"}, "No selected Shape Keys")
             return {"CANCELLED"}
 
+        selected_names = _filter_existing_target_shape_keys(target, selected_names)
+        if not selected_names:
+            self.report({"INFO"}, "All selected Shape Keys already exist on target")
+            return {"CANCELLED"}
+
         mdt = MeshDataTransfer(source=source, target=target, vertex_group=None)
         ok = mdt.transfer_shape_keys(shapekey_names=selected_names)
 
@@ -1626,6 +1702,11 @@ class SKV_OT_TransferFrom(Operator):
 
         if not selected_names:
             self.report({"ERROR"}, "Source has no transferable Shape Keys")
+            return {"CANCELLED"}
+
+        selected_names = _filter_existing_target_shape_keys(target, selected_names)
+        if not selected_names:
+            self.report({"INFO"}, "All source Shape Keys already exist on target")
             return {"CANCELLED"}
 
         mdt = MeshDataTransfer(source=source, target=target, vertex_group=None)

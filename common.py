@@ -69,13 +69,18 @@ def group_names(key_data):
     return [g.name for g in key_data.skv_groups]
 
 
+def get_fallback_group_name(key_data) -> str:
+    if has_group_storage(key_data) and getattr(key_data, "skv_groups", None) and len(key_data.skv_groups) > 0:
+        name = (key_data.skv_groups[0].name or "").strip()
+        return name or INIT_GROUP_NAME
+    return INIT_GROUP_NAME
+
+
 def is_initialized(key_data) -> bool:
-    """Return True when addon storage exists and default group is present."""
+    """Return True when addon storage exists and at least one group is present."""
     if not has_group_storage(key_data):
         return False
-    if not getattr(key_data, "skv_groups", None):
-        return False
-    return any(g.name == INIT_GROUP_NAME for g in key_data.skv_groups)
+    return bool(getattr(key_data, "skv_groups", None)) and len(key_data.skv_groups) > 0
 
 
 def cleanup_legacy_init_group(key_data) -> None:
@@ -139,11 +144,13 @@ def cleanup_legacy_init_group(key_data) -> None:
 def get_selected_group_name(key_data):
     if not has_group_storage(key_data) or not key_data.skv_groups:
         return INIT_GROUP_NAME
+
     idx = int(getattr(key_data, "skv_group_index", 0))
     if 0 <= idx < len(key_data.skv_groups):
-        name = key_data.skv_groups[idx].name
-        return name if name else INIT_GROUP_NAME
-    return INIT_GROUP_NAME
+        name = (key_data.skv_groups[idx].name or "").strip()
+        return name if name else get_fallback_group_name(key_data)
+
+    return get_fallback_group_name(key_data)
 
 
 def enum_groups_for_active_object(self, context):
@@ -151,7 +158,7 @@ def enum_groups_for_active_object(self, context):
     key_data = get_shape_key_data(obj) if obj else None
     if not key_data or not has_group_storage(key_data) or not key_data.skv_groups:
         return [(INIT_GROUP_NAME, INIT_GROUP_NAME, "Not initialized")]
-    return [(g.name, g.name, "") for g in key_data.skv_groups]
+    return [(g.name, g.name, "") for g in key_data.skv_groups if g.name]
 
 
 def tag_redraw_view3d(context):
@@ -191,14 +198,19 @@ def show_select_update(self, context):
 
 
 def kd_get_group(key_data, kb_name: str) -> str:
+    fallback = get_fallback_group_name(key_data)
+
     if not key_data or not hasattr(key_data, "skv_key_groups"):
-        return INIT_GROUP_NAME
+        return fallback
     if not kb_name:
-        return INIT_GROUP_NAME
+        return fallback
+
     for it in key_data.skv_key_groups:
         if it.name == kb_name:
-            return it.group if it.group else INIT_GROUP_NAME
-    return INIT_GROUP_NAME
+            group_name = (it.group or "").strip()
+            return group_name if group_name else fallback
+
+    return fallback
 
 
 def kd_set_group(key_data, kb_name: str, group_name: str) -> None:
@@ -206,7 +218,8 @@ def kd_set_group(key_data, kb_name: str, group_name: str) -> None:
         return
     if not kb_name:
         return
-    group_name = group_name or INIT_GROUP_NAME
+
+    group_name = (group_name or "").strip() or get_fallback_group_name(key_data)
 
     for it in key_data.skv_key_groups:
         if it.name == kb_name:
@@ -269,7 +282,12 @@ def kd_clear_selected(key_data) -> None:
 def count_keys_in_group(key_data, group_name: str) -> int:
     if not key_data or not getattr(key_data, "key_blocks", None):
         return 0
-    return sum(1 for kb in key_data.key_blocks if kd_get_group(key_data, kb.name) == group_name)
+
+    return sum(
+        1
+        for kb in key_data.key_blocks
+        if kb.name != "Basis" and kd_get_group(key_data, kb.name) == group_name
+    )
 
 
 def count_selected_in_group(key_data, group_name: str, search: str) -> int:
@@ -281,6 +299,8 @@ def count_selected_in_group(key_data, group_name: str, search: str) -> int:
 
     c = 0
     for kb in key_data.key_blocks:
+        if kb.name == "Basis":
+            continue
         if kd_get_group(key_data, kb.name) != group_name:
             continue
         if s and s not in kb.name.lower():
@@ -301,11 +321,13 @@ def ensure_init_setup_write(obj):
 
     cleanup_legacy_init_group(key_data)
 
-    names = group_names(key_data)
-    if INIT_GROUP_NAME not in names:
+    if len(key_data.skv_groups) == 0:
         g = key_data.skv_groups.add()
         g.name = INIT_GROUP_NAME
-        names = group_names(key_data)
+        try:
+            g.last_name = INIT_GROUP_NAME
+        except Exception:
+            pass
 
     try:
         if key_data.skv_group_index < 0 or key_data.skv_group_index >= len(key_data.skv_groups):
@@ -313,13 +335,16 @@ def ensure_init_setup_write(obj):
     except Exception:
         pass
 
+    names = group_names(key_data)
+    fallback_group = get_fallback_group_name(key_data)
+
     valid_kb_names = {kb.name for kb in key_data.key_blocks}
     kd_prune_group_map(key_data, valid_kb_names)
 
     for kb in key_data.key_blocks:
         cur = kd_get_group(key_data, kb.name)
         if cur not in names:
-            kd_set_group(key_data, kb.name, INIT_GROUP_NAME)
+            kd_set_group(key_data, kb.name, fallback_group)
 
     for kb in key_data.key_blocks:
         try:

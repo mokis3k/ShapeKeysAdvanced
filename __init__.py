@@ -217,6 +217,9 @@ def _active_keys_update_from_values(obj) -> None:
 
     eps = 1e-6
     for kb in key_data.key_blocks:
+        if kb.name == "Basis":
+            continue
+
         d = _defaults_get(key_data, kb.name)
         if d is None:
             continue
@@ -1163,9 +1166,6 @@ class SKV_PT_ObjectPanel(Panel):
         row = layout.row(align=True)
         row.label(text=obj.name if obj else "No selected object", icon="MESH_DATA")
 
-        if obj:
-            row.operator("skv.synchronize_values", text="Synchronize values", icon="FILE_REFRESH")
-
 
 class SKV_PT_ShapeKeysPanel(Panel):
     bl_label = "Shape Keys"
@@ -1192,7 +1192,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
             layout.label(text="No shape keys found", icon="INFO")
 
             row = layout.row(align=True)
-            row.operator("skv.transfer_from", text="Transfer from...", icon="IMPORT")
+            row.operator("skv.transfer_from", text="Transfer from", icon="IMPORT")
 
             _draw_quick_shape_keys_block(layout, context, obj, key_data)
             return
@@ -1202,6 +1202,10 @@ class SKV_PT_ShapeKeysPanel(Panel):
             return
 
         _defaults_ensure(key_data)
+
+        top_actions = layout.row(align=True)
+        top_actions.operator("skv.transfer_from", text="Transfer from", icon="IMPORT")
+        top_actions.operator("skv.synchronize_values", text="Synchronize values", icon="FILE_REFRESH")
 
         current_group = get_selected_group_name(key_data) or INIT_GROUP_NAME
 
