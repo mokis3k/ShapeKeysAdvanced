@@ -87,20 +87,6 @@ def _ensure_group_exists(key_data, group_name: str) -> bool:
         return False
 
 
-def _filter_existing_target_shape_keys(target_obj, key_names):
-    # Return only shape keys that do not already exist on target.
-    target_key_data = get_shape_key_data(target_obj)
-    if not target_key_data or not getattr(target_key_data, "key_blocks", None):
-        return [n for n in (key_names or []) if n and n != "Basis"]
-
-    existing = {kb.name for kb in target_key_data.key_blocks}
-    return [
-        n
-        for n in (key_names or [])
-        if n and n != "Basis" and n not in existing
-    ]
-
-
 def inherit_transferred_groups(source_obj, target_obj, key_names) -> int:
     # Copy source group mapping to target for transferred shape keys.
     if not source_obj or not target_obj or source_obj == target_obj:
@@ -192,6 +178,50 @@ def _remove_empty_transfer_fallback_group(target_key_data) -> None:
             target_key_data.skv_last_group_index = int(target_key_data.skv_group_index)
     except Exception:
         pass
+
+
+def _remove_existing_target_shape_keys(target_obj, key_names) -> int:
+    # Remove target shape keys with names matching transferred keys.
+    if not target_obj or getattr(target_obj, "type", None) != "MESH":
+        return 0
+
+    target_key_data = get_shape_key_data(target_obj)
+    if not target_key_data or not getattr(target_key_data, "key_blocks", None):
+        return 0
+
+    if getattr(target_key_data, "library", None) is not None:
+        return 0
+
+    names = [n for n in (key_names or []) if n and n != "Basis"]
+    if not names:
+        return 0
+
+    removed = 0
+
+    try:
+        active_index = int(getattr(target_obj, "active_shape_key_index", 0))
+    except Exception:
+        active_index = 0
+
+    for key_name in names:
+        kb = target_key_data.key_blocks.get(key_name)
+        if not kb or kb.name == "Basis":
+            continue
+
+        try:
+            target_obj.shape_key_remove(kb)
+            removed += 1
+        except Exception:
+            continue
+
+    try:
+        target_key_data = get_shape_key_data(target_obj)
+        if target_key_data and getattr(target_key_data, "key_blocks", None):
+            target_obj.active_shape_key_index = min(active_index, len(target_key_data.key_blocks) - 1)
+    except Exception:
+        pass
+
+    return removed
 
 
 # -----------------------------
@@ -1591,10 +1621,7 @@ class SKV_OT_TransferTo(Operator):
             self.report({"ERROR"}, "No selected Shape Keys")
             return {"CANCELLED"}
 
-        selected_names = _filter_existing_target_shape_keys(target, selected_names)
-        if not selected_names:
-            self.report({"INFO"}, "All selected Shape Keys already exist on target")
-            return {"CANCELLED"}
+        _remove_existing_target_shape_keys(target, selected_names)
 
         mdt = MeshDataTransfer(source=source, target=target, vertex_group=None)
         ok = mdt.transfer_shape_keys(shapekey_names=selected_names)
@@ -1663,10 +1690,23 @@ class SKV_OT_TransferFrom(Operator):
         if not source or getattr(source, "type", None) != "MESH" or source.name == target.name:
             context.scene.skv_transfer_target = None
 
-        return context.window_manager.invoke_props_dialog(self, width=320)
+        return context.window_manager.invoke_props_dialog(self, width=350)
 
     def draw(self, context):
         layout = self.layout
+
+        target = get_active_object(context)
+        target_key_data = get_shape_key_data(target) if target else None
+        target_has_shape_keys = bool(
+            target_key_data
+            and getattr(target_key_data, "key_blocks", None)
+            and any(kb.name != "Basis" for kb in target_key_data.key_blocks)
+        )
+
+        if target_has_shape_keys:
+            box = layout.box()
+            box.label(text="Warning: matching Shape Keys on target will be replaced.", icon="ERROR")
+
         layout.prop(context.scene, "skv_transfer_target", text="Source")
         layout.prop(context.scene.skv_props, "transfer_inheritance", text="Inherit presets")
         layout.prop(context.scene.skv_props, "transfer_keyframes_inheritance", text="Inherit keyframes")
@@ -1704,10 +1744,7 @@ class SKV_OT_TransferFrom(Operator):
             self.report({"ERROR"}, "Source has no transferable Shape Keys")
             return {"CANCELLED"}
 
-        selected_names = _filter_existing_target_shape_keys(target, selected_names)
-        if not selected_names:
-            self.report({"INFO"}, "All source Shape Keys already exist on target")
-            return {"CANCELLED"}
+        _remove_existing_target_shape_keys(target, selected_names)
 
         mdt = MeshDataTransfer(source=source, target=target, vertex_group=None)
         try:

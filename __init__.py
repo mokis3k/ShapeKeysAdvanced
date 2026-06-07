@@ -33,10 +33,12 @@ from .common import (
     INIT_GROUP_NAME,
     kd_selected_set,
     kd_get_group,
+    kd_set_group,
     kd_set_selected,
     kd_clear_selected,
     is_internal_value_change,
     skv_shape_key_list_sync_active,
+    skv_sync_shape_key_list_indices,
     skv_sync_shape_key_list_indices,
 )
 from . import groups
@@ -693,10 +695,25 @@ class SKV_OT_QuickShapeKeyAdd(Operator):
 
         if key_data and getattr(key_data, "key_blocks", None):
             try:
-                obj.active_shape_key_index = len(key_data.key_blocks) - 1
-                props.quick_keys_index = len(key_data.key_blocks) - 1
+                current_group = get_selected_group_name(key_data) or INIT_GROUP_NAME
+                kd_set_group(key_data, new_kb.name, current_group)
             except Exception:
                 pass
+
+            try:
+                skv_sync_shape_key_list_indices(
+                    context,
+                    obj,
+                    new_kb.name,
+                    set_blender_active=True,
+                )
+            except Exception:
+                try:
+                    obj.active_shape_key_index = len(key_data.key_blocks) - 1
+                    props.keys_index = len(key_data.key_blocks) - 1
+                    props.quick_keys_index = len(key_data.key_blocks) - 1
+                except Exception:
+                    pass
 
         try:
             new_kb.value = 1.0
