@@ -445,7 +445,7 @@ def skv_shape_key_list_sync_active() -> bool:
 
 
 def skv_is_quick_shape_key_name(name: str) -> bool:
-    return bool(re.fullmatch(r"Shape Key(?: \d+)?", name or ""))
+    return bool(re.fullmatch(r"Quick Key(?: \d+)?", name or ""))
 
 
 def skv_find_shape_key_index(key_data, key_name: str) -> int:

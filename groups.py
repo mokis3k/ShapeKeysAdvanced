@@ -1426,6 +1426,68 @@ class SKV_OT_GroupRemove(Operator):
         return {"FINISHED"}
 
 
+class SKV_OT_GroupMove(Operator):
+    bl_idname = "skv.group_move"
+    bl_label = "Move Group"
+    bl_options = {"REGISTER", "UNDO"}
+
+    direction: StringProperty(name="Direction", default="UP")
+
+    @classmethod
+    def poll(cls, context):
+        obj = get_active_object(context)
+        key_data = get_shape_key_data(obj) if obj else None
+        return bool(
+            obj
+            and key_data
+            and has_group_storage(key_data)
+            and getattr(key_data, "skv_groups", None)
+            and len(key_data.skv_groups) > 1
+        )
+
+    def execute(self, context):
+        obj = get_active_object(context)
+        key_data = get_shape_key_data(obj) if obj else None
+
+        if not obj or not key_data or not has_group_storage(key_data):
+            return {"CANCELLED"}
+
+        if getattr(key_data, "library", None) is not None:
+            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
+            return {"CANCELLED"}
+
+        groups = key_data.skv_groups
+        idx = int(getattr(key_data, "skv_group_index", 0))
+
+        if not (0 <= idx < len(groups)):
+            return {"CANCELLED"}
+
+        if self.direction == "UP":
+            new_idx = idx - 1
+        elif self.direction == "DOWN":
+            new_idx = idx + 1
+        else:
+            return {"CANCELLED"}
+
+        if not (0 <= new_idx < len(groups)):
+            return {"CANCELLED"}
+
+        try:
+            groups.move(idx, new_idx)
+            key_data.skv_group_index = new_idx
+        except Exception:
+            return {"CANCELLED"}
+
+        try:
+            if hasattr(key_data, "skv_last_group_index"):
+                key_data.skv_last_group_index = new_idx
+        except Exception:
+            pass
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+
 class SKV_OT_GroupRename(Operator):
     bl_idname = "skv.group_rename"
     bl_label = "Rename Group"
@@ -1819,6 +1881,7 @@ CLASSES = (
     SKV_OT_ResetGroupValues,
     SKV_OT_GroupAdd,
     SKV_OT_GroupRemove,
+    SKV_OT_GroupMove,
     SKV_OT_GroupRename,
     SKV_OT_CreateGroupFromSelected,
     SKV_OT_TransferTo,

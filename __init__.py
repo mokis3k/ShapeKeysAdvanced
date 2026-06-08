@@ -1253,6 +1253,12 @@ class SKV_PT_ShapeKeysPanel(Panel):
             col.operator("skv.group_add", icon="ADD", text="")
             col.operator("skv.group_remove", icon="REMOVE", text="")
 
+            up = col.operator("skv.group_move", icon="TRIA_UP", text="")
+            up.direction = "UP"
+
+            down = col.operator("skv.group_move", icon="TRIA_DOWN", text="")
+            down.direction = "DOWN"
+
         keys_col = layout.column(align=True)
         hk = keys_col.row(align=True)
         ik = "TRIA_DOWN" if props.keys_open else "TRIA_RIGHT"
