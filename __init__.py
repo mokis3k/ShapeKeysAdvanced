@@ -4,7 +4,7 @@ bl_info = {
     "version": (0, 5, 5),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > ShapeKeys",
-    "description": "Shape keys grouping, selection tools, presets, and mesh data transfer.",
+    "description": "Shape keys grouping, selection tools, presets, and shape key transfer.",
     "category": "Object",
 }
 
@@ -38,7 +38,6 @@ from .common import (
     kd_clear_selected,
     is_internal_value_change,
     skv_shape_key_list_sync_active,
-    skv_sync_shape_key_list_indices,
     skv_sync_shape_key_list_indices,
 )
 from . import groups
@@ -843,11 +842,9 @@ def transfer_open_update(self, context):
     # Clear last transfer status when the module is collapsed.
     if not getattr(self, "transfer_open", False):
         obj = getattr(context, "active_object", None)
-        if obj and hasattr(obj, "skv_mesh_data_transfer"):
-            try:
-                obj.skv_mesh_data_transfer.transfer_status = ""
-            except Exception:
-                pass
+        def transfer_open_update(self, context):
+            # No legacy transfer status to clear.
+            pass
 
 
 # def affix_select_update(self, context):
@@ -1085,7 +1082,7 @@ class SKV_Props(PropertyGroup):
     quick_shape_key_editing: BoolProperty(name="Quick Shape Key Editing", default=False)
     quick_shape_key_name: StringProperty(name="Quick Shape Key Name", default="")
 
-    transfer_open: BoolProperty(name="Shape Keys Transfer", default=False, update=transfer_open_update)
+    transfer_open: BoolProperty(name="Shape Keys Transfer", default=False)
     transfer_inheritance: BoolProperty(
         name="Inherit presets",
         default=False,
@@ -1491,7 +1488,7 @@ def register():
 
     bpy.types.Key.skv_auto_keyframes = CollectionProperty(type=groups.SKV_AutoKeyframeEntry)
 
-    bpy.types.Object.skv_mesh_data_transfer = PointerProperty(type=transfer.SKV_MeshDataSettings)
+    bpy.types.Object.skv_transfer_settings = PointerProperty(type=transfer.SKV_TransferSettings)
 
     _ensure_handler_installed()
     try:
@@ -1505,7 +1502,8 @@ def register():
 def unregister():
     _ensure_handler_removed()
 
-    del bpy.types.Object.skv_mesh_data_transfer
+    if hasattr(bpy.types.Object, "skv_transfer_settings"):
+        del bpy.types.Object.skv_transfer_settings
 
     if hasattr(bpy.types.Key, "skv_active_keys_index"):
         del bpy.types.Key.skv_active_keys_index

@@ -1661,7 +1661,7 @@ class SKV_OT_TransferTo(Operator):
         return any(n != "Basis" for n in selected)
 
     def execute(self, context):
-        from .transfer import MeshDataTransfer
+        from .transfer import Transfer
         from . import presets
 
         source = get_active_object(context)
@@ -1685,8 +1685,11 @@ class SKV_OT_TransferTo(Operator):
 
         _remove_existing_target_shape_keys(target, selected_names)
 
-        mdt = MeshDataTransfer(source=source, target=target, vertex_group=None)
-        ok = mdt.transfer_shape_keys(shapekey_names=selected_names)
+        transfer_data = Transfer(source=source, target=target, vertex_group=None)
+        try:
+            ok = transfer_data.transfer_shape_keys(shapekey_names=selected_names)
+        finally:
+            transfer_data.free()
 
         if not ok:
             self.report({"WARNING"}, "Nothing transferred")
@@ -1779,7 +1782,7 @@ class SKV_OT_TransferFrom(Operator):
         return bool(obj and getattr(obj, "type", None) == "MESH")
 
     def execute(self, context):
-        from .transfer import MeshDataTransfer
+        from .transfer import Transfer
         from . import presets
 
         target = get_active_object(context)
@@ -1808,11 +1811,11 @@ class SKV_OT_TransferFrom(Operator):
 
         _remove_existing_target_shape_keys(target, selected_names)
 
-        mdt = MeshDataTransfer(source=source, target=target, vertex_group=None)
+        transfer_data = Transfer(source=source, target=target, vertex_group=None)
         try:
-            ok = mdt.transfer_shape_keys(shapekey_names=selected_names)
+            ok = transfer_data.transfer_shape_keys(shapekey_names=selected_names)
         finally:
-            mdt.free()
+            transfer_data.free()
 
         if not ok:
             self.report({"WARNING"}, "Nothing transferred")

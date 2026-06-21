@@ -1,516 +1,603 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# transfer.py - Shape Key Transfer
+#
+# Public API (used by other addon modules):
+#   Transfer               - transfer engine class (used in groups.py)
+#   SKV_TransferSettings   - PropertyGroup stored on bpy.types.Object
+#   CLASSES                - tuple of Blender classes to register
+#
+# Everything else in this file is a private implementation detail.
+# ─────────────────────────────────────────────────────────────────────────────
+
 import bpy
 import bmesh
-import numpy as np
-
+from bpy.types import PropertyGroup
+from bpy.props import StringProperty
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
-
-from bpy.types import PropertyGroup, Operator
-from bpy.props import PointerProperty, StringProperty
+from mathutils.geometry import barycentric_transform
 
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+#  PRIVATE HELPERS - validation
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _is_mesh_object(obj) -> bool:
-    return obj is not None and obj.type == "MESH"
-
-
-def _mesh_poll(self, obj):
-    return _is_mesh_object(obj)
+def _is_valid_mesh_object(obj):
+    # Object must exist, be a MESH, and have mesh data.
+    return obj is not None and getattr(obj, "type", None) == "MESH" and obj.data is not None
 
 
-# -----------------------------------------------------------------------------
-# Mesh cache (source/target)
-# -----------------------------------------------------------------------------
+def _is_target_data_editable(obj):
+    # Reject linked (library) mesh or shape key datablocks.
+    # Writing into linked data would silently fail or corrupt the library override.
+    mesh = obj.data
+    if mesh is None:
+        return False
+    if getattr(mesh, "library", None) is not None:
+        return False
+    if mesh.shape_keys is not None and getattr(mesh.shape_keys, "library", None) is not None:
+        return False
+    return True
 
-class MeshData:
-    """Lightweight mesh wrapper providing numpy accessors + BVH for sampling."""
 
-    def __init__(self, obj, triangulate=True):
-        if not _is_mesh_object(obj):
-            raise TypeError("MeshData requires a mesh object")
-        self.obj = obj
-        self.mesh = obj.data
-        self.triangulate = bool(triangulate)
+def _clamp01(value):
+    return max(0.0, min(1.0, value))
 
-        self.bvhtree = None
-        self.transfer_bmesh = None
 
-    def free(self) -> None:
-        if self.transfer_bmesh is not None:
-            try:
-                self.transfer_bmesh.free()
-            except Exception:
-                pass
-        self.transfer_bmesh = None
-        self.bvhtree = None
+# ══════════════════════════════════════════════════════════════════════════════
+#  PRIVATE HELPERS - geometry
+# ══════════════════════════════════════════════════════════════════════════════
 
-    @property
-    def shape_keys(self):
-        if self.mesh.shape_keys:
-            return self.mesh.shape_keys.key_blocks
-        return None
+def _get_basis_coords_local(obj):
+    # Local-space coordinates of the neutral (Basis) shape, independent of
+    # the currently active shape key. Falls back to mesh.vertices if there
+    # are no shape keys.
+    mesh = obj.data
+    if mesh.shape_keys and len(mesh.shape_keys.key_blocks) > 0:
+        return [Vector(d.co) for d in mesh.shape_keys.key_blocks[0].data]
+    return [v.co.copy() for v in mesh.vertices]
 
-    @property
-    def v_count(self) -> int:
-        return len(self.mesh.vertices)
 
-    def get_verts_position(self) -> np.ndarray:
-        v_count = len(self.mesh.vertices)
-        co = np.zeros(v_count * 3, dtype=np.float32)
-        self.mesh.vertices.foreach_get("co", co)
-        co.shape = (v_count, 3)
-        return co
+def _get_sk_coords_local(obj, sk_name):
+    # Local-space coordinates of a named shape key on the object.
+    return [Vector(d.co) for d in obj.data.shape_keys.key_blocks[sk_name].data]
 
-    def get_selected_verts(self) -> np.ndarray:
-        v_count = len(self.mesh.vertices)
-        sel = np.zeros(v_count, dtype=np.float32)
-        self.mesh.vertices.foreach_get("select", sel)
-        sel.shape = (v_count, 1)
-        return sel
 
-    # ---- Vertex group mask ----
+def _to_world(matrix_world, coords_local):
+    return [matrix_world @ co for co in coords_local]
 
-    def get_vertex_group_weights(self, vertex_group_name: str):
-        v_group = self.obj.vertex_groups.get(vertex_group_name)
-        if not v_group:
-            return None
 
-        v_count = len(self.mesh.vertices)
-        weights = np.zeros(v_count, dtype=np.float32)
-        for i in range(v_count):
-            try:
-                weights[i] = v_group.weight(i)
-            except RuntimeError:
-                weights[i] = 0.0
-        weights.shape = (v_count, 1)
-        return weights
+def _to_local(matrix_world_inv, coords_world):
+    return [matrix_world_inv @ co for co in coords_world]
 
-    # ---- Shape keys IO ----
 
-    def get_shape_keys_vert_pos(self, exclude_muted=False):
-        if not self.shape_keys:
-            return None
-        data = {}
-        for sk in self.shape_keys:
-            if sk.name == "Basis":
-                continue
-            if exclude_muted and getattr(sk, "mute", False):
-                continue
-            data[sk.name] = self.get_shape_key_vert_pos(sk.name)
-        return data
+_DEGENERATE_EPS = 1e-10
 
-    def get_shape_key_vert_pos(self, shape_key_name: str):
-        if not self.shape_keys:
-            return None
-        sk = self.shape_keys.get(shape_key_name)
-        if not sk:
-            return None
-        v_count = len(sk.data)
-        co = np.zeros(v_count * 3, dtype=np.float32)
-        sk.data.foreach_get("co", co)
-        co.shape = (v_count, 3)
-        return co
 
-    def set_position_as_shape_key(self, shape_key_name: str, co: np.ndarray) -> None:
-        # Ensure Basis exists
-        if not self.shape_keys:
-            self.obj.shape_key_add(name="Basis", from_mix=False)
+def _is_degenerate_tri(a, b, c):
+    # True if the triangle has zero (or near-zero) area.
+    return (b - a).cross(c - a).length_squared < _DEGENERATE_EPS
 
-        key_blocks = self.mesh.shape_keys.key_blocks
-        if shape_key_name in key_blocks:
-            sk = key_blocks[shape_key_name]
-        else:
-            sk = self.obj.shape_key_add(name=shape_key_name, from_mix=False)
 
-        sk.data.foreach_set("co", co.ravel())
+def _build_source_surface(obj, basis_world_coords):
+    """
+    Build a triangulated copy of the source surface in WORLD space and a
+    BVH tree for it. Degenerate (zero-area) triangles are excluded at
+    construction time rather than being handled as a per-vertex fallback,
+    so a query never lands on a degenerate triangle in the first place.
 
-    # ---- BVH / transfer mesh ----
+    bmesh.ops.triangulate does not add new vertices, so triangle vertex
+    indices match the indices used in shape key data.
 
-    def ensure_mesh_data(self) -> None:
-        """Build transfer_bmesh and BVH once."""
-        if self.transfer_bmesh is not None and self.bvhtree is not None:
-            return
+    Returns:
+        bvh         - BVHTree for nearest-point queries (None if no usable
+                      triangles exist)
+        triangles   - list[(i0, i1, i2)] vertex indices per (non-degenerate)
+                      triangle
+        degenerate_count - number of triangles excluded for being degenerate
+    """
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
 
-        bm = bmesh.new()
-        bm.from_mesh(self.mesh)
+        if len(bm.faces) == 0:
+            return None, [], 0
 
+        # Apply world-space Basis coordinates, regardless of the object's
+        # current active shape key.
+        for i, v in enumerate(bm.verts):
+            v.co = basis_world_coords[i]
+
+        bmesh.ops.triangulate(bm, faces=bm.faces[:])
         bm.verts.ensure_lookup_table()
         bm.faces.ensure_lookup_table()
 
-        if self.triangulate:
-            bmesh.ops.triangulate(bm, faces=bm.faces)
-            bm.faces.ensure_lookup_table()
+        if len(bm.faces) == 0:
+            return None, [], 0
 
-        self.transfer_bmesh = bm
-        self.bvhtree = BVHTree.FromBMesh(self.transfer_bmesh)
+        verts_co = [v.co.copy() for v in bm.verts]
+
+        triangles = []
+        degenerate_count = 0
+        for f in bm.faces:
+            idxs = tuple(fv.index for fv in f.verts)
+            if len(idxs) != 3:
+                continue
+            a, b, c = verts_co[idxs[0]], verts_co[idxs[1]], verts_co[idxs[2]]
+            if _is_degenerate_tri(a, b, c):
+                degenerate_count += 1
+                continue
+            triangles.append(idxs)
+
+        if not triangles:
+            return None, [], degenerate_count
+
+        bvh = BVHTree.FromPolygons(verts_co, triangles)
+    finally:
+        bm.free()
+
+    return bvh, triangles, degenerate_count
 
 
-# -----------------------------------------------------------------------------
-# Transfer engine (Closest + barycentric sampling)
-# -----------------------------------------------------------------------------
+def _build_projection_cache(target_basis_world, bvh, triangles):
+    """
+    Project every target vertex (world space) onto the source surface
+    (also world space). Built once and reused for every shape key.
 
-class MeshDataTransfer:
-    def __init__(
-        self,
-        source,
-        target,
-        vertex_group=None,
-        exclude_muted_shapekeys=False,
-        restrict_to_selection=False,
-    ):
-        self.vertex_group = vertex_group
-        self.exclude_muted_shapekeys = bool(exclude_muted_shapekeys)
-        self.restrict_to_selection = bool(restrict_to_selection)
+    Returns:
+        cache             - list of dicts:
+            {'ok': True,  'proj': Vector, 'tri': (i0, i1, i2)}  - success
+            {'ok': False}                                         - fallback
+        projection_failed - count of vertices with no nearest point found
+    """
+    cache = []
+    projection_failed = 0
+    for co in target_basis_world:
+        loc, _normal, tri_idx, _dist = bvh.find_nearest(co)
+        if loc is None or tri_idx is None:
+            cache.append({'ok': False})
+            projection_failed += 1
+        else:
+            cache.append({
+                'ok':   True,
+                'proj': loc.copy(),
+                'tri':  triangles[tri_idx],
+            })
+    return cache, projection_failed
 
-        self.source = MeshData(source)
-        self.target = MeshData(target)
 
-        self._projection_ready = False
-        self.missed_projections = None
-        self.ray_casted = None
-        self.hit_faces = None
-        self.related_ids = None
-        self.has_zero_area_faces = False
-        self.barycentric_coords = None
+def _compute_new_sk_coords(cache, src_basis_world, src_sk_world,
+                           tgt_basis_world, weights, existing_world):
+    """
+    Compute new WORLD-space shape key coordinates for every target vertex.
+    All inputs and outputs are in world space; the caller converts the
+    result back to the target's local space.
 
-    def free(self) -> None:
-        if self.target:
-            self.target.free()
-        if self.source:
-            self.source.free()
+    For vertex i:
+        proj    = nearest point on the source Basis surface (world space)
+        sk_proj = barycentric_transform(proj, basis_tri -> sk_tri)
+        delta   = sk_proj - proj                  (deformation, world units)
+        new_co  = tgt_basis_world[i] + delta * weight
 
-    # ---- Masks ----
+    Args:
+        cache            - result of _build_projection_cache
+        src_basis_world  - source Basis coordinates, world space
+        src_sk_world     - source shape key coordinates, world space
+        tgt_basis_world  - target Basis coordinates, world space
+        weights          - mask weights per target vertex (None = full
+                           transfer everywhere)
+        existing_world   - current world-space coordinates of the target
+                           shape key, if it already existed (None -> falls
+                           back to tgt_basis_world outside the mask)
 
-    def get_vertices_mask(self):
-        selection = None
-        if self.restrict_to_selection:
-            selection = self.target.get_selected_verts()
+    Returns:
+        result            - list[Vector], new vertex positions (world space)
+        barycentric_failed - count of vertices where the barycentric
+                             transform could not be computed (should be
+                             rare/zero, since degenerate triangles are
+                             already excluded from the BVH)
+    """
+    result = []
+    barycentric_failed = 0
 
-        if self.vertex_group:
-            v_group = self.target.get_vertex_group_weights(self.vertex_group)
-            if v_group is None:
-                return selection
-            if selection is not None:
-                v_group = v_group * selection
-            return v_group
+    for i, rec in enumerate(cache):
+        tgt_co = tgt_basis_world[i]
+        w = weights[i] if weights is not None else 1.0
 
-        return selection
+        # Reference position outside the mask area:
+        #   existing shape key  -> its previous (world-space) coordinates
+        #   new shape key       -> target base shape
+        ref_co = existing_world[i] if existing_world is not None else tgt_co
 
-    # ---- Projection cache ----
+        # No projection found, or vertex fully outside the mask -> fallback.
+        if not rec['ok'] or w == 0.0:
+            result.append(ref_co.copy())
+            continue
 
-    def ensure_projection_cache(self) -> None:
-        if self._projection_ready:
-            return
+        proj = rec['proj']
+        i0, i1, i2 = rec['tri']
 
-        self.source.ensure_mesh_data()
-        self.target.ensure_mesh_data()
+        ba = src_basis_world[i0]; bb = src_basis_world[i1]; bc = src_basis_world[i2]
+        sa = src_sk_world[i0];    sb = src_sk_world[i1];    sc = src_sk_world[i2]
 
-        self.cast_verts()
-        self.has_zero_area_faces = self.check_zero_area_triangles(self.hit_faces)
-        self.barycentric_coords = self.get_barycentric_coords(self.ray_casted, self.hit_faces)
-        self._projection_ready = True
+        # Defensive check only: the source surface build already excludes
+        # degenerate basis triangles, so this should normally never trigger.
+        if _is_degenerate_tri(ba, bb, bc):
+            barycentric_failed += 1
+            result.append(ref_co.copy())
+            continue
 
-    def cast_verts(self):
-        self.target.transfer_bmesh.verts.ensure_lookup_table()
-        v_count = len(self.target.mesh.vertices)
+        try:
+            sk_proj = barycentric_transform(proj, ba, bb, bc, sa, sb, sc)
+        except Exception:
+            barycentric_failed += 1
+            result.append(ref_co.copy())
+            continue
 
-        self.ray_casted = np.zeros((v_count, 3), dtype=np.float32)
-        self.hit_faces = np.zeros((v_count, 3, 3), dtype=np.float32)
-        self.related_ids = np.zeros((v_count, 3), dtype=np.int64)
+        delta             = sk_proj - proj
+        fully_transferred = tgt_co + delta
 
-        self.source.transfer_bmesh.faces.ensure_lookup_table()
-        self.missed_projections = np.ones((v_count, 3), dtype=bool)
+        if w >= 1.0:
+            result.append(fully_transferred)
+        else:
+            result.append(ref_co.lerp(fully_transferred, w))
 
-        for v in self.target.transfer_bmesh.verts:
-            projection = self.source.bvhtree.find_nearest(v.co)
+    return result, barycentric_failed
 
-            if projection[0]:
-                face = self.source.transfer_bmesh.faces[projection[2]]
-                tri = (face.verts[0].co, face.verts[1].co, face.verts[2].co)
 
-                v1_id, v2_id, v3_id = face.verts[0].index, face.verts[1].index, face.verts[2].index
-                v_array = np.array([v1_id, v2_id, v3_id], dtype=np.int64)
+# ══════════════════════════════════════════════════════════════════════════════
+#  PUBLIC TRANSFER ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
 
-                vid = v.index
-                self.ray_casted[vid] = projection[0]
-                self.missed_projections[vid] = False
-                self.hit_faces[vid] = tri
-                self.related_ids[vid] = v_array
-            else:
-                vid = v.index
-                self.ray_casted[vid] = v.co
+class Transfer:
+    """
+    Transfers shape keys from one Mesh object to another using a spatial
+    surface correspondence (BVH nearest point + barycentric coordinates).
 
-        return self.ray_casted, self.hit_faces, self.related_ids
+    All projection and deformation math runs in WORLD space: source and
+    target geometry is transformed by their respective matrix_world before
+    matching, and results are converted back to the target's local space
+    before being written. This keeps the result correct even when source
+    and target have different location / rotation / scale.
 
-    @staticmethod
-    def check_zero_area_triangles(triangles: np.ndarray) -> bool:
-        v1 = triangles[:, 1] - triangles[:, 0]
-        v2 = triangles[:, 2] - triangles[:, 0]
-        area_vectors = np.cross(v1, v2)
-        area_magnitudes = np.linalg.norm(area_vectors, axis=1)
-        zero_area = np.isclose(area_magnitudes, 0)
-        return bool(zero_area.any())
+    Usage:
 
-    @staticmethod
-    def get_barycentric_coords(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
-        v0 = triangles[:, 1] - triangles[:, 0]
-        v1 = triangles[:, 2] - triangles[:, 0]
-        v2 = points - triangles[:, 0]
+        t  = Transfer(source=source_obj, target=target_obj, vertex_group=None)
+        ok = t.transfer_shape_keys(shapekey_names=['smile', 'blink'])
+        print(t.last_stats)   # diagnostics for the call above
+        t.free()              # optional, releases cached BVH / projection data
 
-        d00 = np.einsum("ij,ij->i", v0, v0)
-        d01 = np.einsum("ij,ij->i", v0, v1)
-        d11 = np.einsum("ij,ij->i", v1, v1)
-        d20 = np.einsum("ij,ij->i", v2, v0)
-        d21 = np.einsum("ij,ij->i", v2, v1)
+    The BVH tree and projection cache are built once, on the first call to
+    transfer_shape_keys(), and reused on subsequent calls on the same
+    instance (note: this means the instance snapshots source/target
+    transforms and Basis geometry at that point; recreate the Transfer if
+    either object's transform or base mesh changes between calls).
 
-        denom = (d00 * d11 - d01 * d01)
+    After each transfer_shape_keys() call, self.last_stats holds counters
+    useful for diagnosing "missing" vertices:
+        transferred_keys     - shape keys successfully written
+        skipped_keys         - shape keys skipped (data mismatch / write failure)
+        projection_failed    - target vertices with no nearest source point
+        degenerate_triangles - source triangles excluded as zero-area
+        barycentric_failed   - vertices where barycentric transform failed
+                               (defensive case, normally 0)
+        masked_vertices      - target vertices with mask weight == 0
 
-        # Avoid division by zero warnings; NaNs are handled later via has_zero_area_faces.
-        with np.errstate(divide="ignore", invalid="ignore"):
-            v = (d11 * d20 - d01 * d21) / denom
-            w = (d00 * d21 - d01 * d20) / denom
-            u = 1.0 - v - w
+    Note on performance: this implementation uses plain Python loops and
+    mathutils.Vector rather than numpy. This is fine for typical character
+    meshes and a handful of shape keys, but transfer time scales with
+    vertex count x shape key count, so very dense meshes with many shape
+    keys will be noticeably slower than a vectorized implementation.
+    """
 
-        bary = np.stack((u, v, w), axis=1).astype(np.float32)
-        return bary
+    def __init__(self, source, target, vertex_group=None):
+        """
+        source        - Blender Object (Mesh) to read shape keys from
+        target        - Blender Object (Mesh) to write shape keys to
+        vertex_group  - name of a vertex group on target used as a transfer
+                        mask (str or None)
+        """
+        self._source  = source
+        self._target  = target
+        self._vg_name = vertex_group or ""
 
-    @staticmethod
-    def calculate_barycentric_location(tri_points: np.ndarray, bary_coords: np.ndarray) -> np.ndarray:
-        return (
-            tri_points[:, 0] * bary_coords[:, [0]] +
-            tri_points[:, 1] * bary_coords[:, [1]] +
-            tri_points[:, 2] * bary_coords[:, [2]]
-        )
+        # Heavy resources, built lazily by _prepare().
+        self._bvh             = None
+        self._triangles        = None
+        self._src_mat          = None
+        self._tgt_mat          = None
+        self._tgt_mat_inv      = None
+        self._src_basis_world  = None
+        self._tgt_basis_world  = None
+        self._cache            = None
+        self._weights          = None
+        self._base_stats       = None
+        self._ready            = False
 
-    def get_transferred_vert_coords(self, transfer_coord: np.ndarray) -> np.ndarray:
-        indexes = self.related_ids.ravel()
-        sorted_coords = transfer_coord[indexes]
-        sorted_coords.shape = self.hit_faces.shape
-        transferred = self.calculate_barycentric_location(sorted_coords, self.barycentric_coords)
-        return transferred
+        self.last_stats = {}
 
-    # ---- Shape keys transfer ----
+    # ── Private ──────────────────────────────────────────────────────────
 
-    def transfer_shape_keys(self, shapekey_names=None) -> bool:
-        shape_keys = self.source.get_shape_keys_vert_pos(exclude_muted=self.exclude_muted_shapekeys)
-        if not shape_keys:
+    def _prepare(self):
+        # Build the BVH tree and projection cache in world space.
+        # No-op if already prepared.
+        if self._ready:
+            return True
+
+        source = self._source
+        target = self._target
+
+        if not _is_valid_mesh_object(source):
+            return False
+        if not _is_valid_mesh_object(target):
             return False
 
-        self.ensure_projection_cache()
+        if not source.data.shape_keys or len(source.data.shape_keys.key_blocks) < 2:
+            return False
 
-        # Target Basis coordinates (local)
-        undeformed_verts = self.target.get_verts_position()
+        if len(source.data.polygons) == 0:
+            return False
 
-        # Source Basis coords (local)
-        base_coords = self.source.get_verts_position()
+        if len(target.data.vertices) == 0:
+            return False
 
-        # Transfer source Basis to target space (for delta extraction)
-        base_transferred_position = self.get_transferred_vert_coords(base_coords)
-        if self.has_zero_area_faces:
-            base_transferred_position = np.where(
-                np.isnan(base_transferred_position),
-                undeformed_verts,
-                base_transferred_position,
-            )
+        if not _is_target_data_editable(target):
+            return False
 
-        # Fallback for missed projections
-        base_transferred_position = np.where(self.missed_projections, undeformed_verts, base_transferred_position)
+        src_basis_local = _get_basis_coords_local(source)
+        tgt_basis_local = _get_basis_coords_local(target)
 
-        masked_vertices = self.get_vertices_mask()
+        # Guard against corrupted/non-standard basis data.
+        if len(src_basis_local) != len(source.data.vertices):
+            return False
+        if len(tgt_basis_local) != len(target.data.vertices):
+            return False
 
-        # Preserve target slider values and active key index (avoid "stuck" deformation after transfer).
-        target_obj = self.target.obj
-        pre_active_index = int(getattr(target_obj, "active_shape_key_index", 0))
-        pre_values = {}
-        if self.target.shape_keys:
-            for kb in self.target.shape_keys:
-                pre_values[kb.name] = float(kb.value)
+        # Snapshot world matrices once; reused for every shape key.
+        src_mat     = source.matrix_world.copy()
+        tgt_mat     = target.matrix_world.copy()
+        tgt_mat_inv = tgt_mat.inverted_safe()
 
-        for sk_name, sk_points in shape_keys.items():
-            if shapekey_names is not None and sk_name not in shapekey_names:
-                continue
+        src_basis_world = _to_world(src_mat, src_basis_local)
+        tgt_basis_world = _to_world(tgt_mat, tgt_basis_local)
 
-            src_kb = self.source.shape_keys.get(sk_name) if self.source.shape_keys else None
-            slider_min = src_kb.slider_min if src_kb else 0.0
-            slider_max = src_kb.slider_max if src_kb else 1.0
+        bvh, triangles, degenerate_count = _build_source_surface(source, src_basis_world)
+        if bvh is None or not triangles:
+            return False
 
-            transferred_sk = self.get_transferred_vert_coords(sk_points)
-            transferred_sk = np.where(self.missed_projections, undeformed_verts, transferred_sk)
+        cache, projection_failed = _build_projection_cache(tgt_basis_world, bvh, triangles)
 
-            if self.has_zero_area_faces:
-                transferred_sk = np.where(np.isnan(transferred_sk), undeformed_verts, transferred_sk)
+        weights = None
+        masked_vertices = 0
+        if self._vg_name:
+            vg = target.vertex_groups.get(self._vg_name)
+            if vg is not None:
+                weights = []
+                for idx in range(len(tgt_basis_world)):
+                    try:
+                        w = vg.weight(idx)
+                    except RuntimeError:
+                        w = 0.0
+                    w = _clamp01(w)
+                    weights.append(w)
+                    if w == 0.0:
+                        masked_vertices += 1
 
-            # Extract deltas in target local space
-            delta = transferred_sk - base_transferred_position
-
-            # Apply vertex group mask. Outside mask: keep existing target shape (if any), otherwise Basis.
-            if masked_vertices is not None:
-                delta = delta * masked_vertices
-
-                if self.target.shape_keys and self.target.shape_keys.get(sk_name):
-                    old = self.target.get_shape_key_vert_pos(sk_name)
-                    if old is not None:
-                        inverted_mask = 1.0 - masked_vertices
-                        old_delta = (old - undeformed_verts) * inverted_mask
-                        delta = old_delta + delta
-
-            final_coords = undeformed_verts + delta
-
-            self.target.set_position_as_shape_key(shape_key_name=sk_name, co=final_coords)
-
-            # Restore slider limits and keep target value unchanged (or 0.0 for new keys).
-            try:
-                dst_kb = self.target.shape_keys.get(sk_name)
-                if dst_kb:
-                    dst_kb.slider_min = slider_min
-                    dst_kb.slider_max = slider_max
-                    dst_kb.value = pre_values.get(sk_name, 0.0)
-            except Exception:
-                pass
-
-        # Force Basis to a neutral slider value after transfer.
-        try:
-            if self.target.shape_keys and self.target.shape_keys.get("Basis"):
-                self.target.shape_keys.get("Basis").value = 0.0
-        except Exception:
-            pass
-
-        # Restore active key index (best-effort).
-        try:
-            target_obj.active_shape_key_index = pre_active_index if self.target.shape_keys else 0
-        except Exception:
-            pass
-
+        self._src_mat         = src_mat
+        self._tgt_mat         = tgt_mat
+        self._tgt_mat_inv     = tgt_mat_inv
+        self._src_basis_world = src_basis_world
+        self._tgt_basis_world = tgt_basis_world
+        self._bvh             = bvh
+        self._triangles        = triangles
+        self._cache            = cache
+        self._weights           = weights
+        self._base_stats = {
+            "projection_failed":    projection_failed,
+            "degenerate_triangles": degenerate_count,
+            "masked_vertices":      masked_vertices,
+        }
+        self._ready = True
         return True
 
-# -----------------------------------------------------------------------------
-# Properties
-# -----------------------------------------------------------------------------
+    # ── Public ───────────────────────────────────────────────────────────
 
-class SKV_MeshDataSettings(PropertyGroup):
-    mesh_source: PointerProperty(
-        name="Source",
-        type=bpy.types.Object,
-        poll=_mesh_poll,
-    )
+    def transfer_shape_keys(self, shapekey_names=None):
+        """
+        Transfer shape keys from source to target.
 
-    # Kept as StringProperty for robustness; UI uses prop_search to present it as a dropdown list.
-    vertex_group_filter: StringProperty(
-        name="Vertex Group",
-        default="",
-    )
+        shapekey_names - list of shape key names to transfer;
+                         None = all source shape keys except Basis.
 
-    transfer_status: StringProperty(
-        name="Status",
-        default="",
-        options={'SKIP_SAVE'},
-    )
+        Returns True if at least one shape key was transferred.
+        Diagnostics for this call are available afterwards in self.last_stats.
+        """
+        self.last_stats = {
+            "transferred_keys":     0,
+            "skipped_keys":         0,
+            "projection_failed":    0,
+            "degenerate_triangles": 0,
+            "barycentric_failed":   0,
+            "masked_vertices":      0,
+        }
 
-
-# -----------------------------------------------------------------------------
-# Operator
-# -----------------------------------------------------------------------------
-
-class SKV_OT_TransferMeshData(Operator):
-    bl_idname = "skv.transfer_mesh_data"
-    bl_label = "Transfer Shape Keys"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        if not _is_mesh_object(obj):
+        if not self._prepare():
             return False
-        if context.object is None or context.object.mode != "OBJECT":
+
+        self.last_stats.update(self._base_stats)
+
+        source   = self._source
+        target   = self._target
+        src_mesh = source.data
+        tgt_mesh = target.data
+
+        key_blocks = src_mesh.shape_keys.key_blocks
+        basis_name = key_blocks[0].name
+
+        candidates = [kb for kb in key_blocks if kb.name != basis_name]
+        if shapekey_names is not None:
+            name_set   = set(shapekey_names)
+            candidates = [kb for kb in candidates if kb.name in name_set]
+
+        if not candidates:
             return False
-        p = getattr(obj, "skv_mesh_data_transfer", None)
-        return p is not None and p.mesh_source is not None
 
-    def execute(self, context):
-        active = context.active_object
-        p = active.skv_mesh_data_transfer
-
-        def _clear_fields():
+        # Ensure the target has a Basis shape key.
+        if not tgt_mesh.shape_keys:
             try:
-                p.mesh_source = None
-                p.vertex_group_filter = ""
+                target.shape_key_add(name='Basis', from_mix=False)
+            except Exception:
+                return False
+
+        # ── Save target state (value + mute) before touching anything ──────
+        saved_state = {}
+        for kb in tgt_mesh.shape_keys.key_blocks:
+            saved_state[kb.name] = {"value": kb.value, "mute": kb.mute}
+
+        saved_active = int(getattr(target, "active_shape_key_index", 0))
+
+        tgt_mesh.shape_keys.key_blocks[0].value = 0.0
+
+        n_tgt_basis = len(self._tgt_basis_world)
+        transferred = 0
+
+        for src_kb in candidates:
+            src_sk_local = _get_sk_coords_local(source, src_kb.name)
+
+            # Source shape key data must match the source basis length.
+            if len(src_sk_local) != len(self._src_basis_world):
+                self.last_stats["skipped_keys"] += 1
+                continue
+
+            src_sk_world = _to_world(self._src_mat, src_sk_local)
+
+            tgt_kb        = tgt_mesh.shape_keys.key_blocks.get(src_kb.name)
+            existing_world = None
+            prev_value    = 0.0
+            prev_mute     = False
+
+            if tgt_kb is not None:
+                # Existing target shape key data must match the target basis length.
+                if len(tgt_kb.data) != n_tgt_basis:
+                    self.last_stats["skipped_keys"] += 1
+                    continue
+                saved      = saved_state.get(src_kb.name, {})
+                prev_value = saved.get("value", 0.0)
+                prev_mute  = saved.get("mute", False)
+                if self._weights is not None:
+                    existing_local = [Vector(d.co) for d in tgt_kb.data]
+                    existing_world = _to_world(self._tgt_mat, existing_local)
+
+            new_coords_world, bary_failed = _compute_new_sk_coords(
+                self._cache, self._src_basis_world, src_sk_world,
+                self._tgt_basis_world, self._weights, existing_world,
+            )
+            self.last_stats["barycentric_failed"] += bary_failed
+
+            if tgt_kb is None:
+                try:
+                    tgt_kb = target.shape_key_add(name=src_kb.name, from_mix=False)
+                except Exception:
+                    self.last_stats["skipped_keys"] += 1
+                    continue
+
+            if len(tgt_kb.data) != len(new_coords_world):
+                self.last_stats["skipped_keys"] += 1
+                continue
+
+            new_coords_local = _to_local(self._tgt_mat_inv, new_coords_world)
+
+            try:
+                for i, co in enumerate(new_coords_local):
+                    tgt_kb.data[i].co = co
+            except Exception:
+                # Rare RNA/data write failure - skip this key rather than
+                # leaving it half-written.
+                self.last_stats["skipped_keys"] += 1
+                continue
+
+            try:
+                tgt_kb.slider_min = src_kb.slider_min
+                tgt_kb.slider_max = src_kb.slider_max
+            except Exception:
+                # Slider range is secondary; don't let it block the transfer.
+                pass
+
+            tgt_kb.value = prev_value
+            tgt_kb.mute  = prev_mute
+
+            transferred += 1
+            self.last_stats["transferred_keys"] += 1
+
+        # ── Restore target state ────────────────────────────────────────────
+        for kb in tgt_mesh.shape_keys.key_blocks:
+            saved = saved_state.get(kb.name)
+            if saved is not None:
+                kb.value = saved["value"]
+                kb.mute  = saved["mute"]
+
+        tgt_mesh.shape_keys.key_blocks[0].value = 0.0
+
+        try:
+            n_keys = len(tgt_mesh.shape_keys.key_blocks)
+            target.active_shape_key_index = min(saved_active, max(0, n_keys - 1))
+        except Exception:
+            pass
+
+        if transferred > 0:
+            try:
+                target.data.update()
             except Exception:
                 pass
 
-        source = p.mesh_source
-        if not _is_mesh_object(source):
-            p.transfer_status = "Failed transfer"
-            _clear_fields()
-            self.report({'ERROR'}, "Invalid source object (must be Mesh).")
-            return {'CANCELLED'}
+        return transferred > 0
 
-        mask_vertex_group = p.vertex_group_filter.strip() if p.vertex_group_filter else ""
-        mask_vertex_group = mask_vertex_group if mask_vertex_group else None
-
-        transfer_data = MeshDataTransfer(
-            source=source,
-            target=active,
-            vertex_group=mask_vertex_group,
-            exclude_muted_shapekeys=False,
-            restrict_to_selection=False,
-        )
-
-        try:
-            ok = bool(transfer_data.transfer_shape_keys())
-        except RuntimeError as e:
-            p.transfer_status = "Failed transfer"
-            _clear_fields()
-            self.report({'ERROR'}, str(e))
-            return {'CANCELLED'}
-        finally:
-            transfer_data.free()
-
-        p.transfer_status = "Transfer was successful" if ok else "Failed transfer"
-        _clear_fields()
-
-        return {'FINISHED'} if ok else {'CANCELLED'}
+    def free(self):
+        # Release cached BVH / projection data. Safe to call multiple times.
+        self._bvh             = None
+        self._triangles        = None
+        self._cache            = None
+        self._weights           = None
+        self._src_mat           = None
+        self._tgt_mat           = None
+        self._tgt_mat_inv       = None
+        self._src_basis_world   = None
+        self._tgt_basis_world   = None
+        self._base_stats        = None
+        self._ready             = False
 
 
-# -----------------------------------------------------------------------------
-# UI hook (called from main addon panel)
-# -----------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+#  PROPERTYGROUP (per-object settings)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def draw_transfer_ui(layout, context):
-    obj = context.active_object
-    if not _is_mesh_object(obj):
-        layout.label(text="Active object is not a Mesh", icon="ERROR")
-        return
+class SKV_TransferSettings(PropertyGroup):
+    """
+    Per-object transfer settings.
+    Registered as bpy.types.Object.skv_transfer_settings in __init__.py.
 
-    p = getattr(obj, "skv_mesh_data_transfer", None)
-    if p is None:
-        layout.label(text="Transfer settings not available", icon="ERROR")
-        return
+    Currently unused by the UI; kept minimal so it does not conflict with
+    the rest of the addon's architecture.
+    """
 
-    col = layout.column(align=True)
-    col.prop(p, "mesh_source")
-    col.separator()
-
-    # Dropdown-style selection from existing vertex groups (target object).
-    col.prop_search(p, "vertex_group_filter", obj, "vertex_groups", text="Vertex Group")
-    col.separator()
-
-    status = (getattr(p, "transfer_status", "") or "").strip()
-    if status:
-        icon = "INFO" if status == "Transfer was successful" else "ERROR" if status == "Failed transfer" else "INFO"
-        col.label(text=status, icon=icon)
-        col.separator()
-
-    col.operator("skv.transfer_mesh_data", text="Transfer", icon="PASTEDOWN")
+    vertex_group: StringProperty(
+        name="Mask Vertex Group",
+        description=(
+            "Vertex group on this object used as a transfer mask "
+            "(empty = full transfer to all vertices)"
+        ),
+        default="",
+    )
 
 
-# -----------------------------------------------------------------------------
-# Registration (hooked by main addon)
-# -----------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+#  REGISTRATION EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
 
+# Blender classes to register, combined in __init__.py with other modules'
+# CLASSES tuples:
+#   _ALL_CLASSES = _LOCAL_CLASSES + groups.CLASSES + presets.CLASSES + transfer.CLASSES
 CLASSES = (
-    SKV_MeshDataSettings,
-    SKV_OT_TransferMeshData,
+    SKV_TransferSettings,
 )
