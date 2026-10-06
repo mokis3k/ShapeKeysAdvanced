@@ -537,6 +537,282 @@ class SKV_OT_preset_item_capture_max(Operator):
         return {"FINISHED"}
 
 
+class SKV_OT_preset_item_remove(Operator):
+    bl_idname = "skv.preset_item_remove"
+    bl_label = "Remove From Preset"
+    bl_description = "Remove this entry from the preset without deleting the shape key"
+    bl_options = {"REGISTER", "UNDO"}
+
+    item_index: IntProperty(name="Item Index", default=-1)
+
+    def execute(self, context):
+        preset = get_active_global_preset(context.scene)
+        if preset is None:
+            return {"CANCELLED"}
+
+        index = int(self.item_index)
+        if index < 0 or index >= len(preset.items):
+            return {"CANCELLED"}
+
+        # Clear the active row before collection indices shift.
+        preset.items_index = -1
+        preset.items.remove(index)
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+class SKV_OT_preset_object_remove(Operator):
+    bl_idname = "skv.preset_object_remove"
+    bl_label = "Delete object from preset"
+    bl_description = "Delete object from preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    object_name: StringProperty(name="Object Name", default="")
+
+    def execute(self, context):
+        preset = get_active_global_preset(context.scene)
+        if preset is None or not self.object_name:
+            return {"CANCELLED"}
+
+        indices = [
+            index for index, item in enumerate(preset.items)
+            if item.object_name == self.object_name
+        ]
+        if not indices:
+            return {"CANCELLED"}
+
+        # Clear the active row before removing entries and shifting indices.
+        preset.items_index = -1
+        for index in reversed(indices):
+            preset.items.remove(index)
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+class SKV_OT_preset_object_select(Operator):
+    bl_idname = "skv.preset_object_select"
+    bl_label = "Select Object"
+    bl_description = "Select this object and make it active"
+    bl_options = {"REGISTER", "UNDO"}
+
+    object_name: StringProperty(name="Object Name", default="")
+
+    def execute(self, context):
+        obj = context.view_layer.objects.get(self.object_name)
+        if obj is None or obj.type != "MESH":
+            self.report(
+                {"WARNING"},
+                "Object is not available in the current view layer.",
+            )
+            return {"CANCELLED"}
+
+        if obj.hide_select or obj.hide_get():
+            self.report(
+                {"WARNING"},
+                "Object is hidden or selection is disabled.",
+            )
+            return {"CANCELLED"}
+
+        try:
+            if context.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+
+            obj.select_set(True)
+            for other in context.view_layer.objects:
+                if other != obj and other.select_get():
+                    other.select_set(False)
+
+            context.view_layer.objects.active = obj
+        except RuntimeError as error:
+            self.report({"WARNING"}, str(error))
+            return {"CANCELLED"}
+
+        context.scene.skv_props.object_pick = obj
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+class SKV_OT_preset_object_transfer(Operator):
+    bl_idname = "skv.preset_object_transfer"
+    bl_label = "Transfer Shape Keys"
+    bl_description = "Transfer this object's shape keys from the selected preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    object_name: StringProperty(name="Source Object", default="")
+    preset_index: IntProperty(name="Preset Index", default=-1)
+
+    def invoke(self, context, event):
+        context.scene.skv_transfer_source_name = self.object_name
+
+        target = context.scene.skv_transfer_target
+        if target and target.name == self.object_name:
+            context.scene.skv_transfer_target = None
+
+        return context.window_manager.invoke_props_dialog(self, width=340)
+
+    def draw(self, context):
+        self.layout.prop(context.scene, "skv_transfer_target", text="Target")
+
+    def execute(self, context):
+        from .transfer import Transfer
+        from .groups import (
+            inherit_transferred_groups,
+            inherit_transferred_keyframes,
+        )
+        from .common import InternalValueChangeGuard
+
+        scene = context.scene
+        index = int(self.preset_index)
+        if index < 0 or index >= len(scene.skv_global_presets):
+            self.report({"ERROR"}, "Preset is no longer available.")
+            return {"CANCELLED"}
+
+        preset = scene.skv_global_presets[index]
+        source = bpy.data.objects.get(self.object_name)
+        target = scene.skv_transfer_target
+
+        if not source or source.type != "MESH":
+            self.report({"ERROR"}, "Source mesh is not available.")
+            return {"CANCELLED"}
+
+        if not target or target.type != "MESH" or target == source:
+            self.report({"ERROR"}, "Choose a target mesh different from source.")
+            return {"CANCELLED"}
+
+        source_data = get_shape_key_data(source)
+        target_data = get_shape_key_data(target)
+
+        if not source_data or not source_data.key_blocks:
+            self.report({"ERROR"}, "Source has no Shape Keys.")
+            return {"CANCELLED"}
+
+        if target.data.library is not None or (
+            target_data and target_data.library is not None
+        ):
+            self.report({"ERROR"}, "Target data is linked (read-only).")
+            return {"CANCELLED"}
+
+        # Snapshot the source preset entries before adding target entries.
+        source_max = {
+            item.key_name: float(item.max_value)
+            for item in preset.items
+            if item.object_name == source.name
+        }
+        names = [
+            kb.name for kb in source_data.key_blocks
+            if kb.name in source_max
+            and not _is_basis_name(source_data, kb.name)
+        ]
+
+        if not names:
+            self.report({"ERROR"}, "No valid source Shape Keys in this preset.")
+            return {"CANCELLED"}
+
+        if target_data and any(
+            _is_basis_name(target_data, name) for name in names
+        ):
+            self.report({"ERROR"}, "A source key name matches the target Basis.")
+            return {"CANCELLED"}
+
+        existing = [
+            name for name in names
+            if target_data and target_data.key_blocks.get(name) is not None
+        ]
+        missing = [name for name in names if name not in existing]
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except RuntimeError as error:
+                self.report({"ERROR"}, str(error))
+                return {"CANCELLED"}
+
+        created = []
+        if missing:
+            transfer = Transfer(
+                source=source,
+                target=target,
+                vertex_group=None,
+            )
+            try:
+                # Reuse the projection cache and track success per key.
+                with InternalValueChangeGuard():
+                    for name in missing:
+                        if transfer.transfer_shape_keys(shapekey_names=[name]):
+                            created.append(name)
+                        else:
+                            # Remove an incomplete new key if writing failed.
+                            data = get_shape_key_data(target)
+                            kb = data.key_blocks.get(name) if data else None
+                            if kb is not None:
+                                target.shape_key_remove(kb)
+            finally:
+                transfer.free()
+
+        target_data = get_shape_key_data(target)
+        resolved = [
+            name for name in names
+            if name in existing or name in created
+        ]
+
+        if not target_data or not resolved:
+            self.report(
+                {"WARNING"},
+                "No Shape Keys were transferred or matched.",
+            )
+            return {"CANCELLED"}
+
+        # Existing target geometry, values and groups are preserved.
+        with InternalValueChangeGuard():
+            for name in created:
+                target_data.key_blocks[name].value = (
+                    source_data.key_blocks[name].value
+                )
+
+        if created:
+            inherit_transferred_groups(source, target, created)
+
+        # Inherit membership and maxima only in the selected preset.
+        for name in resolved:
+            add_shape_key_to_preset(preset, target, name)
+            for item in preset.items:
+                if item.object_name == target.name and item.key_name == name:
+                    item.max_value = source_max[name]
+                    break
+
+        copied = 0
+        if target_data != source_data:
+            # Isolate shared target actions before replacing their FCurves.
+            anim = getattr(target_data, "animation_data", None)
+            action = getattr(anim, "action", None) if anim else None
+
+            if action and action.users > 1:
+                slot = getattr(anim, "action_slot", None)
+                identifier = getattr(slot, "identifier", "")
+                anim.action = action.copy()
+
+                if identifier:
+                    for new_slot in getattr(anim.action, "slots", ()):
+                        if new_slot.identifier == identifier:
+                            anim.action_slot = new_slot
+                            break
+
+            copied = inherit_transferred_keyframes(
+                source, target, resolved,
+            )
+
+        preset.items_index = -1
+        sync_preset_item_values(context, preset)
+        tag_redraw_view3d(context)
+
+        failed = len(missing) - len(created)
+        level = {"WARNING"} if failed else {"INFO"}
+        self.report(
+            level,
+            f"Created: {len(created)}, existing: {len(existing)}, "
+            f"animated keys copied: {copied}, failed: {failed}",
+        )
+        return {"FINISHED"}
+
 class SKV_OT_preset_toggle_visibility(Operator):
     bl_idname = "skv.preset_toggle_visibility"
     bl_label = "Toggle Preset Visibility"
@@ -677,6 +953,14 @@ class SKV_UL_global_preset_key_sliders(UIList):
         op_row.enabled = preset_item_capture_max_enabled(it)
         op = op_row.operator("skv.preset_item_capture_max", text="", icon="COPYDOWN", emboss=True)
         op.item_index = index
+
+        remove_op = row.operator(
+            "skv.preset_item_remove",
+            text="",
+            icon="REMOVE",
+            emboss=False,
+        )
+        remove_op.item_index = index
 
 
 class SKV_MT_add_to_preset(Menu):
@@ -893,7 +1177,11 @@ CLASSES = (
     SKV_GlobalPresetItem,
     SKV_GlobalPreset,
     SKV_OT_preset_capture_max_index,
+    SKV_OT_preset_object_transfer,
     SKV_OT_preset_item_capture_max,
+    SKV_OT_preset_object_select,
+    SKV_OT_preset_object_remove,
+    SKV_OT_preset_item_remove,
     SKV_OT_preset_toggle_visibility,
     SKV_OT_preset_toggle_auto_keyframe,
     SKV_UL_global_presets,

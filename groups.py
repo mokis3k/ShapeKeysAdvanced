@@ -1318,6 +1318,120 @@ class SKV_OT_ResetGroupValues(Operator):
         return {"FINISHED"}
 
 
+class SKV_OT_DeleteSelectedShapeKeys(Operator):
+    bl_idname = "skv.delete_selected_shape_keys"
+    bl_label = "Delete selected"
+    bl_description = "Delete selected shape keys in the current group"
+    bl_options = {"REGISTER", "UNDO"}
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=340)
+    def draw(self, context):
+        self.layout.label(text="Delete selected Shape Keys?", icon="QUESTION")
+    def execute(self, context):
+        obj = get_active_object(context)
+        key_data = get_shape_key_data(obj) if obj else None
+        if not obj or not key_data or not key_data.key_blocks:
+            return {"CANCELLED"}
+
+        if obj.data.library is not None or key_data.library is not None:
+            self.report({"ERROR"}, "Target data is linked (read-only).")
+            return {"CANCELLED"}
+
+        group_name = get_selected_group_name(key_data)
+        selected = kd_selected_set(key_data)
+        basis_name = key_data.key_blocks[0].name
+        names = [
+            kb.name for kb in key_data.key_blocks
+            if kb.name != basis_name
+            and kb.name in selected
+            and kd_get_group(key_data, kb.name) == group_name
+        ]
+        if not names:
+            self.report({"INFO"}, "No selected shape keys in the current group.")
+            return {"CANCELLED"}
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except RuntimeError as error:
+                self.report({"ERROR"}, str(error))
+                return {"CANCELLED"}
+
+        active_name = obj.active_shape_key.name if obj.active_shape_key else ""
+        deleted = set()
+        with InternalValueChangeGuard():
+            for name in reversed(names):
+                kb = key_data.key_blocks.get(name)
+                if kb is None:
+                    continue
+                try:
+                    obj.shape_key_remove(kb)
+                except RuntimeError as error:
+                    self.report({"WARNING"}, f"Cannot delete {name}: {error}")
+                    continue
+                deleted.add(name)
+
+        if not deleted:
+            return {"CANCELLED"}
+
+        # Remove references only for successfully deleted keys.
+        for attr in (
+            "skv_key_groups",
+            "skv_selected",
+            "skv_key_defaults",
+            "skv_active_keys",
+            "skv_auto_keyframes",
+        ):
+            collection = getattr(key_data, attr, None)
+            if collection is None:
+                continue
+            for index in range(len(collection) - 1, -1, -1):
+                if collection[index].name in deleted:
+                    collection.remove(index)
+
+        # Shared mesh data can be referenced by several objects and scenes.
+        owner_names = {
+            candidate.name for candidate in bpy.data.objects
+            if get_shape_key_data(candidate) == key_data
+        }
+        for scene in bpy.data.scenes:
+            for preset in getattr(scene, "skv_global_presets", ()):
+                changed = False
+                for index in range(len(preset.items) - 1, -1, -1):
+                    item = preset.items[index]
+                    if item.object_name in owner_names and item.key_name in deleted:
+                        preset.items.remove(index)
+                        changed = True
+                if changed:
+                    preset.items_index = -1
+
+        props = context.scene.skv_props
+        if props.quick_shape_key_name in deleted:
+            props.quick_shape_key_editing = False
+            props.quick_shape_key_name = ""
+
+        # Keep the active key when it survives; otherwise use a nearby key.
+        if active_name in deleted or key_data.key_blocks.get(active_name) is None:
+            active_name = next(
+                (
+                    kb.name for kb in key_data.key_blocks
+                    if kb.name != basis_name
+                    and kd_get_group(key_data, kb.name) == group_name
+                ),
+                basis_name,
+            )
+
+        group_index = key_data.skv_group_index
+        skv_sync_shape_key_list_indices(
+            context, obj, active_name, set_blender_active=True,
+        )
+        key_data.skv_group_index = group_index
+
+        tag_redraw_view3d(context)
+        self.report({"INFO"}, f"Deleted Shape Keys: {len(deleted)}")
+        return {"FINISHED"}
+
+
 class SKV_OT_GroupAdd(Operator):
     bl_idname = "skv.group_add"
     bl_label = "Add Group"
@@ -1882,6 +1996,7 @@ CLASSES = (
     # SKV_OT_SelectByAffix,
     SKV_OT_MoveSelectedToGroup,
     SKV_OT_ResetGroupValues,
+    SKV_OT_DeleteSelectedShapeKeys,
     SKV_OT_GroupAdd,
     SKV_OT_GroupRemove,
     SKV_OT_GroupMove,

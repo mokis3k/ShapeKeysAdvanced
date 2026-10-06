@@ -158,20 +158,12 @@ def _active_keys_contains(key_data, key_name: str) -> bool:
 def _active_keys_add_if_needed(key_data, key_name: str) -> None:
     if not key_name or _active_keys_contains(key_data, key_name):
         return
+
     try:
         it = key_data.skv_active_keys.add()
         it.name = key_name
     except Exception:
         return
-
-    # Auto-expand Active Shape Keys block when a new active key is detected.
-    try:
-        scn = bpy.context.scene
-        props = getattr(scn, "skv_props", None)
-        if props:
-            props.active_keys_open = True
-    except Exception:
-        pass
 
 
 _SKV_ACTIVE_KEYS_LAST_FRAME = None
@@ -536,6 +528,41 @@ class SKV_UL_quick_shape_keys(UIList):
 # -----------------------------
 # Operators
 # -----------------------------
+
+class SKV_OT_ActiveKeysClear(Operator):
+    bl_idname = "skv.active_keys_clear"
+    bl_label = "Clear"
+    bl_description = "Clear the Active Shape Keys list without changing shape keys"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = getattr(context, "scene", None)
+        props = getattr(scene, "skv_props", None)
+        obj = getattr(props, "object_pick", None)
+        key_data = get_shape_key_data(obj) if obj else None
+        return bool(
+            key_data
+            and key_data.library is None
+            and hasattr(key_data, "skv_key_defaults")
+            and hasattr(key_data, "skv_active_keys")
+            and len(key_data.skv_active_keys) > 0
+        )
+
+    def execute(self, context):
+        if not self.poll(context):
+            return {"CANCELLED"}
+
+        obj = context.scene.skv_props.object_pick
+        key_data = get_shape_key_data(obj)
+
+        # Capture current values so cleared entries are not added again.
+        _defaults_rebuild(key_data)
+        key_data.skv_active_keys_index = -1
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
 class SKV_OT_SearchClear(Operator):
     bl_idname = "skv.search_clear"
     bl_label = "Clear Search"
@@ -1050,7 +1077,7 @@ class SKV_Props(PropertyGroup):
     groups_open: BoolProperty(name="Groups", default=True)
     keys_open: BoolProperty(name="Keys", default=True)
     quick_keys_open: BoolProperty(name="Quick Shape Keys", default=False)
-    active_keys_open: BoolProperty(name="Active Shape Keys", default=False)
+    active_keys_open: BoolProperty(name="Active Shape Keys", default=True)
     quick_keys_index: IntProperty(
         name="Quick Shape Keys Index",
         default=-1,
@@ -1312,7 +1339,10 @@ class SKV_PT_ShapeKeysPanel(Panel):
 
                 r3 = keys_col.row(align=True)
                 r3.operator("skv.reset_group_values", text="Zero selected values", icon="RECOVER_LAST")
-                r3.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
+                r3.operator("skv.delete_selected_shape_keys", text="Delete selected", icon="TRASH")
+
+                r4 = keys_col.row(align=True)
+                r4.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
 
         _draw_quick_shape_keys_block(layout, context, obj, key_data)
 
@@ -1325,6 +1355,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
         if props.active_keys_open:
             active_count = len(key_data.skv_active_keys) if getattr(key_data, "skv_active_keys", None) else 0
             if active_count > 0:
+                active_col.operator("skv.active_keys_clear", text="Clear")
                 active_rows = max(1, min(active_count, 5))
                 active_col.template_list(
                     "SKV_UL_active_keys",
@@ -1395,23 +1426,65 @@ class SKV_PT_PresetsPanel(Panel):
                 presets_col.separator()
                 presets_col.label(text=f"Shape Keys in {preset_name}")
 
+                active_obj = context.view_layer.objects.active
+
                 for object_name, object_items, controller_item in grouped_items:
                     if not controller_item:
                         continue
 
-                    header = presets_col.row(align=True)
+                    is_active = bool(
+                        active_obj and active_obj.name == object_name
+                    )
+                    object_col = presets_col.column(align=True)
+
+                    # Keep the header accessible for object switching.
+                    header = object_col.row(align=True)
                     header.prop(
                         controller_item,
                         "object_open",
                         text="",
                         emboss=False,
-                        icon=("TRIA_DOWN" if controller_item.object_open else "TRIA_RIGHT"),
+                        icon=(
+                            "TRIA_DOWN"
+                            if controller_item.object_open
+                            else "TRIA_RIGHT"
+                        ),
                     )
-                    header.label(text=object_name, icon="OBJECT_DATA")
+
+                    select_op = header.operator(
+                        "skv.preset_object_select",
+                        text=object_name,
+                        icon="OBJECT_DATA",
+                        emboss=False,
+                    )
+                    select_op.object_name = object_name
+
+                    transfer_row = header.row(align=True)
+                    transfer_row.enabled = is_active
+                    transfer_op = transfer_row.operator(
+                        "skv.preset_object_transfer",
+                        text="",
+                        icon="EXPORT",
+                        emboss=False,
+                    )
+                    transfer_op.object_name = object_name
+                    transfer_op.preset_index = scene.skv_global_preset_index
+
+                    remove_row = header.row(align=True)
+                    remove_row.enabled = is_active
+                    remove_op = remove_row.operator(
+                        "skv.preset_object_remove",
+                        text="",
+                        icon="TRASH",
+                        emboss=False,
+                    )
+                    remove_op.object_name = object_name
 
                     if controller_item.object_open:
+                        keys_col = object_col.column(align=True)
+                        keys_col.enabled = is_active
                         presets.set_preset_list_filter_object(object_name)
-                        presets_col.template_list(
+                        keys_col.template_list(
                             "SKV_UL_global_preset_key_sliders",
                             object_name,
                             gpreset,
@@ -1421,12 +1494,11 @@ class SKV_PT_PresetsPanel(Panel):
                             rows=max(1, min(len(object_items), 5)),
                         )
 
-                presets.set_preset_list_filter_object("")
-
 
 _LOCAL_CLASSES = (
     SKV_UL_quick_shape_keys,
     SKV_OT_SearchClear,
+    SKV_OT_ActiveKeysClear,
     SKV_OT_SynchronizeValues,
     SKV_OT_QuickShapeKeyAdd,
     SKV_OT_QuickShapeKeyDelete,
