@@ -8,7 +8,6 @@ bl_info = {
     "category": "Object",
 }
 
-import re
 import bpy
 from bpy.app.handlers import persistent
 from bpy.types import Operator, Panel, PropertyGroup, UIList
@@ -39,6 +38,7 @@ from .common import (
     is_internal_value_change,
     skv_shape_key_list_sync_active,
     skv_sync_shape_key_list_indices,
+    skv_is_quick_shape_key_name as _is_quick_shape_key_name,
 )
 from . import groups
 from . import presets
@@ -64,10 +64,6 @@ def _poll_sync_values_source(scene, obj):
         return False
     target_name = getattr(scene, "skv_sync_values_target_name", "")
     return (not target_name) or (obj.name != target_name)
-
-
-def _is_quick_shape_key_name(name: str) -> bool:
-    return bool(re.fullmatch(r"Quick Key(?: \d+)?", name or ""))
 
 
 def _iter_quick_shape_keys(key_data):
@@ -116,64 +112,24 @@ def _defaults_rebuild(key_data) -> None:
             it.value = 0.0
 
 
-def _defaults_get(key_data, key_name: str):
-    # Returns default value for given key_name, or None if missing.
-    for it in getattr(key_data, "skv_key_defaults", []) or []:
-        if it.name == key_name:
-            return float(it.value)
-    return None
-
-
 def _defaults_ensure(key_data) -> None:
-    # Ensure defaults exist and match current key blocks set.
-    kb = getattr(key_data, "key_blocks", None)
-    if not kb:
-        return
-
+    keys = getattr(key_data, "key_blocks", None)
     defaults = getattr(key_data, "skv_key_defaults", None)
-    if defaults is None:
+
+    if not keys or defaults is None:
         return
 
-    if len(defaults) == 0:
+    if len(defaults) != len(keys) or any(
+        entry.name != kb.name
+        for entry, kb in zip(defaults, keys)
+    ):
         _defaults_rebuild(key_data)
-        return
-
-    if len(defaults) != len(kb):
-        _defaults_rebuild(key_data)
-        return
-
-    for i, k in enumerate(kb):
-        if defaults[i].name != k.name:
-            _defaults_rebuild(key_data)
-            return
-
-
-def _active_keys_contains(key_data, key_name: str) -> bool:
-    for it in getattr(key_data, "skv_active_keys", []) or []:
-        if it.name == key_name:
-            return True
-    return False
-
-
-def _active_keys_add_if_needed(key_data, key_name: str) -> None:
-    if not key_name or _active_keys_contains(key_data, key_name):
-        return
-
-    try:
-        it = key_data.skv_active_keys.add()
-        it.name = key_name
-    except Exception:
-        return
 
 
 _SKV_ACTIVE_KEYS_LAST_FRAME = None
 
 
 def _active_keys_update_from_values(obj) -> None:
-    # Add keys that differ from defaults to the active list (do not auto-remove).
-    # Only treat manual edits as "active":
-    # - ignore updates during animation playback and frame changes (evaluation/scrub)
-    # - ignore programmatic changes made by addon operators (guarded)
     global _SKV_ACTIVE_KEYS_LAST_FRAME
 
     key_data = get_shape_key_data(obj)
@@ -181,46 +137,42 @@ def _active_keys_update_from_values(obj) -> None:
         return
     if not has_group_storage(key_data) or not is_initialized(key_data):
         return
-
-    if is_internal_value_change():
+    if key_data.library is not None or is_internal_value_change():
         return
 
-    # Ignore playback-driven changes.
-    try:
-        scr = bpy.context.screen
-        if scr and getattr(scr, "is_animation_playing", False):
-            return
-    except Exception:
-        pass
+    screen = bpy.context.screen
+    if screen and screen.is_animation_playing:
+        return
 
-    # Ignore changes caused by frame evaluation (scrub / frame step).
-    try:
-        cur_frame = int(bpy.context.scene.frame_current)
-    except Exception:
-        cur_frame = None
-
-    if cur_frame is not None:
-        if _SKV_ACTIVE_KEYS_LAST_FRAME is None:
-            _SKV_ACTIVE_KEYS_LAST_FRAME = cur_frame
-        elif cur_frame != _SKV_ACTIVE_KEYS_LAST_FRAME:
-            _SKV_ACTIVE_KEYS_LAST_FRAME = cur_frame
-            return
+    frame = int(bpy.context.scene.frame_current)
+    if _SKV_ACTIVE_KEYS_LAST_FRAME is None:
+        _SKV_ACTIVE_KEYS_LAST_FRAME = frame
+    elif frame != _SKV_ACTIVE_KEYS_LAST_FRAME:
+        _SKV_ACTIVE_KEYS_LAST_FRAME = frame
+        return
 
     _defaults_ensure(key_data)
 
-    eps = 1e-6
+    defaults = {}
+    for item in key_data.skv_key_defaults:
+        defaults.setdefault(item.name, float(item.value))
+
+    active = {
+        item.name for item in key_data.skv_active_keys
+    }
+
     for kb in key_data.key_blocks:
-        if kb.name == "Basis":
+        if kb.name == "Basis" or kb.name in active:
             continue
 
-        d = _defaults_get(key_data, kb.name)
-        if d is None:
+        default = defaults.get(kb.name)
+        if default is None:
             continue
-        try:
-            if abs(float(kb.value) - float(d)) > eps:
-                _active_keys_add_if_needed(key_data, kb.name)
-        except Exception:
-            continue
+
+        if abs(float(kb.value) - default) > 1e-6:
+            item = key_data.skv_active_keys.add()
+            item.name = kb.name
+            active.add(kb.name)
 
 
 # -----------------------------
@@ -429,61 +381,75 @@ def _auto_process_active_object(scene):
         _SKV_SYNC_GUARD = False
 
 
+_SKV_DEPSGRAPH_GUARD = False
+
 @persistent
 def _depsgraph_update_post(scene, depsgraph):
-    # 1) keep selection->addon sync + auto-init
-    _auto_process_active_object(scene)
-    # 2) update active-keys list from value changes (do not remove)
+    global _SKV_DEPSGRAPH_GUARD
+
+    if _SKV_DEPSGRAPH_GUARD:
+        return
+
+    _SKV_DEPSGRAPH_GUARD = True
     try:
+        _auto_process_active_object(scene)
+
         obj = getattr(bpy.context, "active_object", None)
-        if obj and getattr(obj, "type", None) == "MESH":
+        if obj and obj.type == "MESH":
             _active_keys_update_from_values(obj)
-    except Exception:
-        pass
-    # 3) auto keyframe (enabled per shape key)
-    try:
+
         props = getattr(scene, "skv_props", None)
-        obj = getattr(props, "object_pick", None) if props else None
-        if not obj:
-            obj = getattr(bpy.context, "active_object", None)
-        if obj and getattr(obj, "type", None) == "MESH":
-            key_data = get_shape_key_data(obj)
-            if key_data and hasattr(key_data, "skv_auto_keyframes") and len(key_data.skv_auto_keyframes) > 0:
+        obj = (
+            getattr(props, "object_pick", None)
+            if props else None
+        ) or obj
+
+        if obj and obj.type == "MESH":
+            data = get_shape_key_data(obj)
+            entries = getattr(data, "skv_auto_keyframes", ())
+            enabled = [
+                item for item in entries if item.enabled
+            ]
+
+            if data and data.library is None and enabled:
+                keys = {
+                    kb.name: kb for kb in data.key_blocks
+                }
                 frame = int(scene.frame_current)
-                eps = 1e-6
 
-                if getattr(key_data, "library", None) is None and getattr(key_data, "key_blocks", None):
-                    for it in key_data.skv_auto_keyframes:
-                        if not getattr(it, "enabled", False):
-                            continue
-                        name = (it.name or "").strip()
-                        if not name:
-                            continue
-                        kb = key_data.key_blocks.get(name)
-                        if not kb:
-                            continue
+                for item in enabled:
+                    kb = keys.get((item.name or "").strip())
+                    if kb is None:
+                        continue
 
+                    value = float(kb.value)
+
+                    if frame != item.last_frame:
+                        item.last_frame = frame
+                        item.last_value = value
+                        continue
+
+                    if abs(value - item.last_value) > 1e-6:
                         try:
-                            cur_val = float(kb.value)
-                        except Exception:
-                            cur_val = 0.0
+                            data.keyframe_insert(
+                                data_path=groups._shape_key_value_data_path(
+                                    kb.name
+                                ),
+                                frame=frame,
+                            )
+                        except RuntimeError:
+                            pass
 
-                        last_frame = int(getattr(it, "last_frame", -999999))
-                        last_val = float(getattr(it, "last_value", cur_val))
+                        item.last_value = value
 
-                        if frame != last_frame:
-                            it.last_frame = frame
-                            it.last_value = cur_val
-                            continue
-
-                        if abs(cur_val - last_val) > eps:
-                            try:
-                                key_data.keyframe_insert(data_path=f'key_blocks["{kb.name}"].value', frame=frame)
-                            except Exception:
-                                pass
-                            it.last_value = cur_val
-    except Exception:
-        pass
+        preset = presets.get_active_global_preset(scene)
+        if preset is not None:
+            presets.sync_preset_item_values(
+                bpy.context,
+                preset,
+            )
+    finally:
+        _SKV_DEPSGRAPH_GUARD = False
 
 
 def _ensure_handler_installed():
@@ -920,110 +886,6 @@ def transfer_open_update(self, context):
 #     tag_redraw_view3d(context)
 
 
-def _sync_shape_key_list_indices(context, obj, key_data=None) -> None:
-    # Sync UI list active rows from Blender active shape key.
-    props = getattr(context.scene, "skv_props", None) if context else None
-    if not props or not obj:
-        return
-
-    if key_data is None:
-        key_data = get_shape_key_data(obj)
-
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return
-
-    active_name = _get_object_active_shape_key_name(obj)
-    if not active_name:
-        return
-
-    for i, kb in enumerate(key_data.key_blocks):
-        if kb.name == active_name:
-            try:
-                props.keys_index = i
-            except Exception:
-                pass
-
-            try:
-                if _is_quick_shape_key_name(kb.name):
-                    props.quick_keys_index = i
-            except Exception:
-                pass
-
-            break
-
-    try:
-        for i, it in enumerate(key_data.skv_active_keys):
-            if it.name == active_name:
-                key_data.skv_active_keys_index = i
-                break
-    except Exception:
-        pass
-
-
-def _set_object_active_shape_key(obj, key_name: str) -> bool:
-    # Set Blender active shape key by key name.
-    if not obj or getattr(obj, "type", None) != "MESH" or not key_name:
-        return False
-
-    key_data = get_shape_key_data(obj)
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return False
-
-    for i, kb in enumerate(key_data.key_blocks):
-        if kb.name == key_name:
-            try:
-                obj.active_shape_key_index = i
-                return True
-            except Exception:
-                return False
-
-    return False
-
-
-def _get_object_active_shape_key_name(obj) -> str:
-    # Return the current Blender active shape key name.
-    if not obj or getattr(obj, "type", None) != "MESH":
-        return ""
-
-    key_data = get_shape_key_data(obj)
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return ""
-
-    idx = int(getattr(obj, "active_shape_key_index", -1))
-    if 0 <= idx < len(key_data.key_blocks):
-        return key_data.key_blocks[idx].name
-
-    return ""
-
-
-def keys_index_update(self, context):
-    # Sync Shape Keys in group list selection to Blender active shape key.
-    obj = getattr(self, "object_pick", None)
-    key_data = get_shape_key_data(obj) if obj else None
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return
-
-    idx = int(getattr(self, "keys_index", -1))
-    if 0 <= idx < len(key_data.key_blocks):
-        _set_object_active_shape_key(obj, key_data.key_blocks[idx].name)
-        tag_redraw_view3d(context)
-
-
-def quick_keys_index_update(self, context):
-    # Sync Quick Shape Keys list selection to Blender active shape key.
-    obj = getattr(self, "object_pick", None)
-    key_data = get_shape_key_data(obj) if obj else None
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return
-
-    idx = int(getattr(self, "quick_keys_index", -1))
-    if 0 <= idx < len(key_data.key_blocks):
-        kb = key_data.key_blocks[idx]
-        if _is_quick_shape_key_name(kb.name):
-            _set_object_active_shape_key(obj, kb.name)
-            tag_redraw_view3d(context)
-
-
 def keys_index_update(self, context):
     # Sync Shape Keys in group list selection to all shape key lists.
     if skv_shape_key_list_sync_active():
@@ -1242,8 +1104,6 @@ class SKV_PT_ShapeKeysPanel(Panel):
         if not is_initialized(key_data):
             return
 
-        _defaults_ensure(key_data)
-
         top_actions = layout.row(align=True)
         top_actions.operator("skv.transfer_from", text="Transfer from", icon="IMPORT")
         top_actions.operator("skv.synchronize_values", text="Synchronize values", icon="FILE_REFRESH")
@@ -1416,11 +1276,6 @@ class SKV_PT_PresetsPanel(Panel):
 
         gpreset = presets.get_active_global_preset(scene)
         if gpreset:
-            try:
-                presets.sync_preset_item_values(context, gpreset)
-            except Exception:
-                pass
-
             grouped_items = list(presets.iter_preset_items_grouped(gpreset))
             if grouped_items:
                 presets_col.separator()
@@ -1519,7 +1374,12 @@ def register():
     bpy.types.Scene.skv_props = PointerProperty(type=SKV_Props)
 
     bpy.types.Scene.skv_global_presets = CollectionProperty(type=presets.SKV_GlobalPreset)
-    bpy.types.Scene.skv_global_preset_index = IntProperty(name="Preset Index", default=0, min=0)
+    bpy.types.Scene.skv_global_preset_index = IntProperty(
+        name="Preset Index",
+        default=0,
+        min=0,
+        update=presets.global_preset_index_update,
+    )
 
     bpy.types.Scene.skv_transfer_source_name = StringProperty(options={"SKIP_SAVE"})
     bpy.types.Scene.skv_transfer_target = PointerProperty(type=bpy.types.Object, poll=_poll_transfer_target)

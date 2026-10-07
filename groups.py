@@ -32,6 +32,8 @@ from .common import (
     InternalValueChangeGuard,
     skv_shape_key_list_sync_active,
     skv_sync_shape_key_list_indices,
+    kd_group_map,
+    kd_autokf_get_entry as _autokf_get_entry,
 )
 
 
@@ -321,19 +323,6 @@ class SKV_AutoKeyframeEntry(PropertyGroup):
     last_frame: IntProperty(name="Last Frame", default=-999999)
     last_value: FloatProperty(name="Last Value", default=0.0)
 
-
-def _autokf_get_entry(key_data, key_name: str, create: bool = False):
-    if not key_data or not hasattr(key_data, "skv_auto_keyframes"):
-        return None
-    for it in key_data.skv_auto_keyframes:
-        if it.name == key_name:
-            return it
-    if not create:
-        return None
-    it = key_data.skv_auto_keyframes.add()
-    it.name = key_name
-    return it
-
 def group_index_update(self, context):
     # Clear selected shape keys only when the active group index actually changes.
     key_data = self
@@ -357,45 +346,6 @@ def group_index_update(self, context):
         pass
 
     tag_redraw_view3d(context)
-
-def active_keys_index_update(self, context):
-    # Sync Active Shape Keys list selection to all shape key lists.
-    if skv_shape_key_list_sync_active():
-        return
-
-    obj = get_active_object(context)
-    key_data = get_shape_key_data(obj) if obj else None
-    if not obj or not key_data or not hasattr(key_data, "skv_active_keys"):
-        return
-
-    idx = int(getattr(key_data, "skv_active_keys_index", -1))
-    if 0 <= idx < len(key_data.skv_active_keys):
-        key_name = key_data.skv_active_keys[idx].name
-        skv_sync_shape_key_list_indices(
-            context,
-            obj,
-            key_name,
-            set_blender_active=True,
-        )
-
-def _set_object_active_shape_key(obj, key_name: str) -> bool:
-    # Set Blender active shape key by key name.
-    if not obj or getattr(obj, "type", None) != "MESH" or not key_name:
-        return False
-
-    key_data = get_shape_key_data(obj)
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return False
-
-    for i, kb in enumerate(key_data.key_blocks):
-        if kb.name == key_name:
-            try:
-                obj.active_shape_key_index = i
-                return True
-            except Exception:
-                return False
-
-    return False
 
 
 def active_keys_index_update(self, context):
@@ -808,39 +758,35 @@ class SKV_UL_key_blocks(UIList):
     bl_idname = "SKV_UL_key_blocks"
 
     def filter_items(self, context, data, propname):
-        key_data = data
-        props = context.scene.skv_props
-
-        if not key_data:
+        if not data:
             return [], []
 
-        group_name = get_selected_group_name(key_data)
-        tokens = [t.lower() for t in parse_tokens(getattr(props, "search", ""))]
+        group_name = get_selected_group_name(data)
+        mapping = kd_group_map(data)
+        fallback = get_fallback_group_name(data)
+        tokens = [
+            token.lower()
+            for token in parse_tokens(context.scene.skv_props.search)
+        ]
 
-        flt_flags = []
-        flt_neworder = []
+        flags = []
+        for kb in getattr(data, propname):
+            visible = (
+                    kb.name != "Basis"
+                    and (
+                            not group_name
+                            or mapping.get(kb.name, fallback) == group_name
+                    )
+                    and all(
+                token in kb.name.lower()
+                for token in tokens
+            )
+            )
+            flags.append(
+                self.bitflag_filter_item if visible else 0
+            )
 
-        bf = self.bitflag_filter_item
-        for kb in getattr(key_data, propname):
-            ok = True
-
-            if kb.name == "Basis":
-                ok = False
-
-            if ok and group_name:
-                if kd_get_group(key_data, kb.name) != group_name:
-                    ok = False
-
-            if ok and tokens:
-                name_l = kb.name.lower()
-                for t in tokens:
-                    if t not in name_l:
-                        ok = False
-                        break
-
-            flt_flags.append(bf if ok else 0)
-
-        return flt_flags, flt_neworder
+        return flags, []
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         kb = item

@@ -199,37 +199,43 @@ def show_select_update(self, context):
 
 def kd_get_group(key_data, kb_name: str) -> str:
     fallback = get_fallback_group_name(key_data)
+    entries = getattr(key_data, "skv_key_groups", None)
 
-    if not key_data or not hasattr(key_data, "skv_key_groups"):
+    if entries is None or not kb_name:
         return fallback
-    if not kb_name:
+
+    item = entries.get(kb_name)
+    if item is None:
         return fallback
 
-    for it in key_data.skv_key_groups:
-        if it.name == kb_name:
-            group_name = (it.group or "").strip()
-            return group_name if group_name else fallback
-
-    return fallback
+    return (item.group or "").strip() or fallback
 
 
 def kd_set_group(key_data, kb_name: str, group_name: str) -> None:
-    if not key_data or not hasattr(key_data, "skv_key_groups"):
+    entries = getattr(key_data, "skv_key_groups", None)
+    if entries is None or not kb_name:
         return
-    if not kb_name:
-        return
 
-    group_name = (group_name or "").strip() or get_fallback_group_name(key_data)
+    group_name = (
+        (group_name or "").strip()
+        or get_fallback_group_name(key_data)
+    )
 
-    for it in key_data.skv_key_groups:
-        if it.name == kb_name:
-            it.group = group_name
-            return
+    item = entries.get(kb_name)
+    if item is None:
+        item = entries.add()
+        item.name = kb_name
 
-    it = key_data.skv_key_groups.add()
-    it.name = kb_name
-    it.group = group_name
+    item.group = group_name
 
+
+def kd_is_selected(key_data, kb_name: str) -> bool:
+    entries = getattr(key_data, "skv_selected", None)
+    return bool(
+        kb_name
+        and entries is not None
+        and entries.get(kb_name) is not None
+    )
 
 def kd_prune_group_map(key_data, valid_names) -> None:
     if not key_data or not hasattr(key_data, "skv_key_groups"):
@@ -246,15 +252,6 @@ def kd_selected_set(key_data):
     if not key_data or not hasattr(key_data, "skv_selected"):
         return set()
     return {it.name for it in key_data.skv_selected if it.name}
-
-
-def kd_is_selected(key_data, kb_name: str) -> bool:
-    if not kb_name or not key_data or not hasattr(key_data, "skv_selected"):
-        return False
-    for it in key_data.skv_selected:
-        if it.name == kb_name:
-            return True
-    return False
 
 
 def kd_set_selected(key_data, kb_name: str, state: bool) -> None:
@@ -279,35 +276,71 @@ def kd_clear_selected(key_data) -> None:
     key_data.skv_selected.clear()
 
 
-def count_keys_in_group(key_data, group_name: str) -> int:
+def kd_group_map(key_data):
+    fallback = get_fallback_group_name(key_data)
+    result = {}
+    for item in getattr(key_data, "skv_key_groups", ()):
+        result.setdefault(
+            item.name,
+            (item.group or "").strip() or fallback,
+        )
+    return result
+
+
+def kd_group_counts(key_data):
     if not key_data or not getattr(key_data, "key_blocks", None):
-        return 0
+        return {}
 
-    return sum(
-        1
-        for kb in key_data.key_blocks
-        if kb.name != "Basis" and kd_get_group(key_data, kb.name) == group_name
-    )
+    mapping = kd_group_map(key_data)
+    fallback = get_fallback_group_name(key_data)
+    counts = {}
 
-
-def count_selected_in_group(key_data, group_name: str, search: str) -> int:
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return 0
-
-    s = (search or "").strip().lower()
-    selected = kd_selected_set(key_data)
-
-    c = 0
     for kb in key_data.key_blocks:
         if kb.name == "Basis":
             continue
-        if kd_get_group(key_data, kb.name) != group_name:
-            continue
-        if s and s not in kb.name.lower():
-            continue
-        if kb.name in selected:
-            c += 1
-    return c
+        name = mapping.get(kb.name, fallback)
+        counts[name] = counts.get(name, 0) + 1
+
+    return counts
+
+
+def kd_autokf_get_entry(key_data, key_name: str, create: bool = False):
+    entries = getattr(key_data, "skv_auto_keyframes", None)
+    if entries is None or not key_name:
+        return None
+
+    item = entries.get(key_name)
+    if item is None and create:
+        item = entries.add()
+        item.name = key_name
+
+    return item
+
+
+def count_keys_in_group(key_data, group_name: str) -> int:
+    return kd_group_counts(key_data).get(group_name, 0)
+
+
+def count_selected_in_group(
+    key_data,
+    group_name: str,
+    search: str,
+) -> int:
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return 0
+
+    mapping = kd_group_map(key_data)
+    fallback = get_fallback_group_name(key_data)
+    selected = kd_selected_set(key_data)
+    search = (search or "").strip().lower()
+
+    return sum(
+        1 for kb in key_data.key_blocks
+        if kb.name != "Basis"
+        and kb.name in selected
+        and mapping.get(kb.name, fallback) == group_name
+        and (not search or search in kb.name.lower())
+    )
 
 
 def ensure_init_setup_write(obj):

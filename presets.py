@@ -13,6 +13,7 @@ from .common import (
     _is_basis_name,
     skv_shape_key_list_sync_active,
     skv_sync_shape_key_list_indices,
+    kd_autokf_get_entry as _autokf_get_entry,
 )
 
 _PRESET_ITEM_SYNC_GUARD = False
@@ -54,24 +55,19 @@ def get_active_global_preset(scene):
 
 def sync_preset_item_values(context, preset) -> None:
     global _PRESET_ITEM_SYNC_GUARD
+
+    previous_guard = _PRESET_ITEM_SYNC_GUARD
     _PRESET_ITEM_SYNC_GUARD = True
     try:
-        for it in preset.items:
-            obj = bpy.data.objects.get(it.object_name) if it.object_name else None
-            if not obj or getattr(obj, "type", None) != "MESH":
-                continue
-            key_data = get_shape_key_data(obj)
-            if not key_data or not getattr(key_data, "key_blocks", None):
-                continue
-            kb = key_data.key_blocks.get(it.key_name)
-            if not kb:
-                continue
-            try:
-                it.value = float(kb.value)
-            except Exception:
-                pass
+        for item, data, kb in _iter_resolved_preset_items(preset):
+            value = float(kb.value)
+            if float(item.value) != value:
+                try:
+                    item.value = value
+                except (RuntimeError, AttributeError):
+                    continue
     finally:
-        _PRESET_ITEM_SYNC_GUARD = False
+        _PRESET_ITEM_SYNC_GUARD = previous_guard
 
 
 def _preset_item_value_update(self, context):
@@ -112,85 +108,79 @@ def _preset_item_value_update(self, context):
 
 
 def global_preset_apply(preset, context) -> None:
-    global _GLOBAL_PRESET_APPLY_GUARD
+    global _GLOBAL_PRESET_APPLY_GUARD, _PRESET_ITEM_SYNC_GUARD
+
     if _GLOBAL_PRESET_APPLY_GUARD:
         return
 
+    previous_guard = _PRESET_ITEM_SYNC_GUARD
     _GLOBAL_PRESET_APPLY_GUARD = True
+    _PRESET_ITEM_SYNC_GUARD = True
+
     try:
         factor = float(preset.value)
-        for it in preset.items:
-            obj = bpy.data.objects.get(it.object_name) if it.object_name else None
-            if not obj or getattr(obj, "type", None) != "MESH":
-                continue
 
-            key_data = get_shape_key_data(obj)
-            if not key_data or not getattr(key_data, "key_blocks", None):
-                continue
-            if getattr(key_data, "library", None) is not None:
-                continue
-
-            kb = key_data.key_blocks.get(it.key_name)
-            if not kb:
+        for item, data, kb in _iter_resolved_preset_items(preset):
+            if data.library is not None:
                 continue
 
             try:
-                new_val = factor * float(it.max_value)
-            except Exception:
-                continue
+                value = factor * float(item.max_value)
 
-            try:
-                kb.value = new_val
-            except Exception:
-                continue
+                if float(kb.value) != value:
+                    kb.value = value
 
-            global _PRESET_ITEM_SYNC_GUARD
-            _PRESET_ITEM_SYNC_GUARD = True
-            try:
-                it.value = float(new_val)
-            except Exception:
-                pass
-            finally:
-                _PRESET_ITEM_SYNC_GUARD = False
+                actual = float(kb.value)
+                if float(item.value) != actual:
+                    item.value = actual
+            except (RuntimeError, ValueError, TypeError):
+                continue
     finally:
+        _PRESET_ITEM_SYNC_GUARD = previous_guard
         _GLOBAL_PRESET_APPLY_GUARD = False
 
     tag_redraw_view3d(context)
 
+def global_preset_index_update(self, context):
+    preset = get_active_global_preset(self)
+    if preset is not None:
+        sync_preset_item_values(context, preset)
+
+    tag_redraw_view3d(context)
 
 def global_preset_value_update(self, context):
     global_preset_apply(self, context)
 
 
-def _autokf_get_entry(key_data, key_name: str, create: bool = False):
-    if not key_data or not hasattr(key_data, "skv_auto_keyframes"):
-        return None
-    for it in key_data.skv_auto_keyframes:
-        if it.name == key_name:
-            return it
-    if not create:
-        return None
-    it = key_data.skv_auto_keyframes.add()
-    it.name = key_name
-    return it
+def _iter_resolved_preset_items(preset):
+    objects = {}
+
+    for item in preset.items:
+        name = item.object_name
+
+        if name not in objects:
+            obj = bpy.data.objects.get(name) if name else None
+            data = (
+                get_shape_key_data(obj)
+                if obj and obj.type == "MESH"
+                else None
+            )
+            keys = (
+                {kb.name: kb for kb in data.key_blocks}
+                if data and data.key_blocks
+                else {}
+            )
+            objects[name] = (data, keys)
+
+        data, keys = objects[name]
+        kb = keys.get(item.key_name)
+        if kb is not None:
+            yield item, data, kb
 
 
 def _iter_preset_key_blocks(preset):
-    for it in getattr(preset, "items", []):
-        obj = bpy.data.objects.get(it.object_name) if it.object_name else None
-        if not obj or getattr(obj, "type", None) != "MESH":
-            continue
-
-        key_data = get_shape_key_data(obj)
-        if not key_data or not getattr(key_data, "key_blocks", None):
-            continue
-
-        kb = key_data.key_blocks.get(it.key_name)
-        if not kb:
-            continue
-
-        yield key_data, kb
-
+    for item, data, kb in _iter_resolved_preset_items(preset):
+        yield data, kb
 
 def _preset_all_muted(preset) -> bool:
     found = False
@@ -202,13 +192,23 @@ def _preset_all_muted(preset) -> bool:
 
 
 def _preset_all_autokey_enabled(preset) -> bool:
+    maps = {}
     found = False
-    for key_data, kb in _iter_preset_key_blocks(preset):
+
+    for data, kb in _iter_preset_key_blocks(preset):
         found = True
-        entry = _autokf_get_entry(key_data, kb.name, create=False)
-        if not (entry and bool(entry.enabled)):
+        pointer = data.as_pointer()
+
+        if pointer not in maps:
+            maps[pointer] = {
+                item.name: bool(item.enabled)
+                for item in getattr(data, "skv_auto_keyframes", ())
+            }
+
+        if not maps[pointer].get(kb.name, False):
             return False
-    return found and True
+
+    return found
 
 
 def preset_item_capture_max_enabled(it) -> bool:
@@ -323,41 +323,6 @@ def inherit_transferred_keys_to_presets(source_obj, target_obj, key_names) -> in
     return inherited_count
 
 
-def global_preset_items_index_update(self, context):
-    # Sync Shape Keys in preset list selection to all shape key lists.
-    if skv_shape_key_list_sync_active():
-        return
-
-    idx = int(getattr(self, "items_index", -1))
-    if idx < 0 or idx >= len(self.items):
-        return
-
-    it = self.items[idx]
-    obj = bpy.data.objects.get(it.object_name) if it.object_name else None
-    if not obj or getattr(obj, "type", None) != "MESH":
-        return
-
-    try:
-        for ob in context.view_layer.objects:
-            if ob.select_get():
-                ob.select_set(False)
-    except Exception:
-        pass
-
-    try:
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-        context.scene.skv_props.object_pick = obj
-    except Exception:
-        pass
-
-    skv_sync_shape_key_list_indices(
-        context,
-        obj,
-        it.key_name,
-        set_blender_active=True,
-    )
-
 class SKV_GlobalPresetItem(PropertyGroup):
     object_name: StringProperty(name="Object", default="")
     key_name: StringProperty(name="Shape Key", default="")
@@ -373,26 +338,6 @@ class SKV_GlobalPresetItem(PropertyGroup):
         soft_max=1.0,
         update=_preset_item_value_update,
     )
-
-
-def _set_object_active_shape_key(obj, key_name: str) -> bool:
-    # Set Blender active shape key by key name.
-    if not obj or getattr(obj, "type", None) != "MESH" or not key_name:
-        return False
-
-    key_data = get_shape_key_data(obj)
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return False
-
-    for i, kb in enumerate(key_data.key_blocks):
-        if kb.name == key_name:
-            try:
-                obj.active_shape_key_index = i
-                return True
-            except Exception:
-                return False
-
-    return False
 
 
 def global_preset_items_index_update(self, context):
@@ -762,8 +707,9 @@ class SKV_OT_preset_object_transfer(Operator):
             return {"CANCELLED"}
 
         # Existing target geometry, values and groups are preserved.
+        # Synchronize values for both new and existing target keys.
         with InternalValueChangeGuard():
-            for name in created:
+            for name in resolved:
                 target_data.key_blocks[name].value = (
                     source_data.key_blocks[name].value
                 )
