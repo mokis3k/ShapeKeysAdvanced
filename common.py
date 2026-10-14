@@ -6,35 +6,6 @@ INIT_GROUP_NAME = "Main"
 # Prevent recursion when preset slider writes to key values
 _PRESET_APPLY_GUARD = False
 
-# Internal guard for programmatic shape key value changes (addon operators).
-# Used to prevent "Active Shape Keys" being polluted by scripted value updates.
-_SKV_INTERNAL_VALUE_CHANGE_DEPTH = 0
-
-
-def internal_value_change_begin() -> None:
-    global _SKV_INTERNAL_VALUE_CHANGE_DEPTH
-    _SKV_INTERNAL_VALUE_CHANGE_DEPTH += 1
-
-
-def internal_value_change_end() -> None:
-    global _SKV_INTERNAL_VALUE_CHANGE_DEPTH
-    _SKV_INTERNAL_VALUE_CHANGE_DEPTH = max(0, _SKV_INTERNAL_VALUE_CHANGE_DEPTH - 1)
-
-
-def is_internal_value_change() -> bool:
-    return _SKV_INTERNAL_VALUE_CHANGE_DEPTH > 0
-
-
-class InternalValueChangeGuard:
-    def __enter__(self):
-        internal_value_change_begin()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        internal_value_change_end()
-        return False
-
-
 # Utilities
 def get_active_object(context):
     obj = context.active_object
@@ -183,10 +154,7 @@ def parse_tokens(text: str):
 
 
 def clear_selection_ui(context, key_data):
-    if key_data and hasattr(key_data, "skv_selected"):
-        key_data.skv_selected.clear()
-    if hasattr(context, "scene") and hasattr(context.scene, "skv_props"):
-        context.scene.skv_props.show_select = False
+    kd_clear_selected(key_data)
 
 
 def show_select_update(self, context):
@@ -251,7 +219,27 @@ def kd_prune_group_map(key_data, valid_names) -> None:
 def kd_selected_set(key_data):
     if not key_data or not hasattr(key_data, "skv_selected"):
         return set()
-    return {it.name for it in key_data.skv_selected if it.name}
+
+    names = {
+        item.name
+        for item in key_data.skv_selected
+        if item.name
+    }
+
+    source = getattr(key_data, "skv_selection_source", "GROUP")
+
+    if source == "KEYFRAMED":
+        names &= kd_keyframed_names(key_data)
+
+    elif source == "QUICK":
+        valid = {
+            kb.name
+            for kb in key_data.key_blocks[1:]
+            if skv_is_quick_shape_key_name(kb.name)
+        }
+        names &= valid
+
+    return names
 
 
 def kd_set_selected(key_data, kb_name: str, state: bool) -> None:
@@ -321,27 +309,22 @@ def count_keys_in_group(key_data, group_name: str) -> int:
     return kd_group_counts(key_data).get(group_name, 0)
 
 
-def count_selected_in_group(
-    key_data,
-    group_name: str,
-    search: str,
-) -> int:
-    if not key_data or not getattr(key_data, "key_blocks", None):
+def count_selected_in_group(key_data, group_name, search):
+    if not key_data or not key_data.key_blocks:
         return 0
 
-    mapping = kd_group_map(key_data)
-    fallback = get_fallback_group_name(key_data)
+    if key_data.skv_selection_source != "GROUP":
+        return 0
+
+    tokens = [token.lower() for token in parse_tokens(search)]
     selected = kd_selected_set(key_data)
-    search = (search or "").strip().lower()
 
     return sum(
-        1 for kb in key_data.key_blocks
-        if kb.name != "Basis"
-        and kb.name in selected
-        and mapping.get(kb.name, fallback) == group_name
-        and (not search or search in kb.name.lower())
+        kb.name in selected
+        for kb in key_data.key_blocks[1:]
+        if kd_get_group(key_data, kb.name) == group_name
+        and all(token in kb.name.lower() for token in tokens)
     )
-
 
 def ensure_init_setup_write(obj):
     key_data = get_shape_key_data(obj)
@@ -413,7 +396,7 @@ def preset_apply(preset, context) -> None:
     key_data = getattr(preset, "id_data", None)
     if not key_data or not getattr(key_data, "key_blocks", None):
         return
-    if getattr(key_data, "library", None) is not None:
+    if key_data.library is not None:
         return
 
     obj = get_active_object(context)
@@ -422,44 +405,22 @@ def preset_apply(preset, context) -> None:
 
     _PRESET_APPLY_GUARD = True
     try:
-        kb_map = key_data.key_blocks
+        keys = {
+            kb.name: kb for kb in key_data.key_blocks
+        }
         factor = float(preset.value)
 
-        # Prevent "Active Shape Keys" pollution by preset-driven value changes.
-        with InternalValueChangeGuard():
-            for it in preset.items:
-                if not it.name:
-                    continue
-                kb = kb_map.get(it.name)
-                if not kb:
-                    continue
+        for item in preset.items:
+            kb = keys.get(item.name)
+            if kb is None:
+                continue
 
-                try:
-                    new_val = factor * float(it.max_value)
-                except Exception:
-                    continue
-
-                try:
-                    kb.value = new_val
-                except Exception:
-                    continue
-
-                # Sync defaults snapshot to new value so diff-based detector won't add it later.
-                try:
-                    updated = False
-                    if hasattr(key_data, "skv_key_defaults"):
-                        for d in key_data.skv_key_defaults:
-                            if d.name == kb.name:
-                                d.value = float(new_val)
-                                updated = True
-                                break
-                        if not updated:
-                            d = key_data.skv_key_defaults.add()
-                            d.name = kb.name
-                            d.value = float(new_val)
-                except Exception:
-                    pass
-
+            try:
+                value = factor * float(item.max_value)
+                if float(kb.value) != value:
+                    kb.value = value
+            except (RuntimeError, ValueError, TypeError):
+                continue
     finally:
         _PRESET_APPLY_GUARD = False
 
@@ -531,7 +492,6 @@ def skv_sync_shape_key_list_indices(context, obj, key_name: str = "", set_blende
     This synchronizes:
     - Shape Keys in group
     - Quick Shape Keys
-    - Active Shape Keys
     - Shape Keys in active preset
     """
     global _SKV_SHAPE_KEY_LIST_SYNC_GUARD
@@ -584,20 +544,19 @@ def skv_sync_shape_key_list_indices(context, obj, key_name: str = "", set_blende
         except Exception:
             pass
 
-        try:
-            props.quick_keys_index = key_index if skv_is_quick_shape_key_name(key_name) else -1
-        except Exception:
-            pass
+        props.favorites_index = (
+            key_index
+            if key_name in kd_favorite_names(key_data)
+            else -1
+        )
 
         try:
-            active_index = -1
-            if hasattr(key_data, "skv_active_keys"):
-                for i, it in enumerate(key_data.skv_active_keys):
-                    if it.name == key_name:
-                        active_index = i
-                        break
-            if hasattr(key_data, "skv_active_keys_index"):
-                key_data.skv_active_keys_index = active_index
+            props.keyframed_index = (
+                key_index
+                if key_name in kd_keyframed_names(key_data)
+                else -1
+            )
+            props.quick_keys_index = key_index if skv_is_quick_shape_key_name(key_name) else -1
         except Exception:
             pass
 
@@ -618,3 +577,167 @@ def skv_sync_shape_key_list_indices(context, obj, key_name: str = "", set_blende
         tag_redraw_view3d(context)
     finally:
         _SKV_SHAPE_KEY_LIST_SYNC_GUARD = False
+
+def kd_favorite_names(key_data):
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return set()
+
+    valid = {kb.name for kb in key_data.key_blocks[1:]}
+    return {
+        item.name
+        for item in getattr(key_data, "skv_favorites", ())
+        if item.name in valid
+    }
+
+
+def kd_prune_favorites(key_data):
+    if not key_data or key_data.library is not None:
+        return
+
+    entries = getattr(key_data, "skv_favorites", None)
+    if entries is None:
+        return
+
+    valid = kd_favorite_names(key_data)
+
+    for index in range(len(entries) - 1, -1, -1):
+        name = entries[index].name
+        if name not in valid:
+            if key_data.skv_selection_source == "FAVORITES":
+                kd_set_selected(key_data, name, False)
+            entries.remove(index)
+
+
+def skv_list_key_names(
+    key_data,
+    props,
+    source="GROUP",
+    use_search=True,
+):
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return []
+
+    if source == "GROUP":
+        group = get_selected_group_name(key_data)
+        members = {
+            kb.name
+            for kb in key_data.key_blocks[1:]
+            if kd_get_group(key_data, kb.name) == group
+        }
+        search = props.search
+
+    elif source == "FAVORITES":
+        members = kd_favorite_names(key_data)
+        search = props.favorites_search
+
+    elif source == "KEYFRAMED":
+        members = kd_keyframed_names(key_data)
+        search = props.keyframed_search
+
+    elif source == "QUICK":
+        members = {
+            kb.name
+            for kb in key_data.key_blocks[1:]
+            if skv_is_quick_shape_key_name(kb.name)
+        }
+        search = props.quick_search
+
+    else:
+        return []
+
+    tokens = (
+        [token.lower() for token in parse_tokens(search)]
+        if use_search
+        else []
+    )
+
+    return [
+        kb.name
+        for kb in key_data.key_blocks[1:]
+        if kb.name in members
+        and all(token in kb.name.lower() for token in tokens)
+    ]
+
+
+def kd_activate_selection_source(key_data, source):
+    # Keep selection owned by exactly one list.
+    if key_data.skv_selection_source != source:
+        kd_clear_selected(key_data)
+        key_data.skv_selection_source = source
+
+def _skv_iter_action_bindings(anim):
+    if anim.action is not None:
+        yield anim.action, getattr(anim, "action_slot", None)
+
+    def walk(strips):
+        for strip in strips:
+            action = getattr(strip, "action", None)
+
+            if action is not None:
+                yield action, getattr(strip, "action_slot", None)
+
+            yield from walk(getattr(strip, "strips", ()))
+
+    for track in anim.nla_tracks:
+        yield from walk(track.strips)
+
+
+def _skv_iter_bound_fcurves(action, slot):
+    if getattr(action, "is_action_layered", False):
+        # Never inspect another datablock's slot.
+        if slot is None:
+            return
+
+        for layer in action.layers:
+            for strip in layer.strips:
+                channelbag = getattr(strip, "channelbag", None)
+                if channelbag is None:
+                    continue
+
+                bag = channelbag(slot, ensure=False)
+                if bag is not None:
+                    yield from bag.fcurves
+    else:
+        yield from getattr(action, "fcurves", ())
+
+
+def kd_keyframed_names(key_data):
+    if not key_data or not getattr(key_data, "key_blocks", None):
+        return set()
+
+    keys = list(key_data.key_blocks)[1:]
+    valid_names = {kb.name for kb in keys}
+
+    # Enabled Auto Keyframe keeps a key listed without any keyframes.
+    result = {
+        item.name
+        for item in getattr(key_data, "skv_auto_keyframes", ())
+        if item.enabled and item.name in valid_names
+    }
+
+    anim = getattr(key_data, "animation_data", None)
+    if anim is None:
+        return result
+
+    paths = {
+        kb.path_from_id("value"): kb.name
+        for kb in keys
+    }
+    seen = set()
+
+    for action, slot in _skv_iter_action_bindings(anim):
+        binding = (
+            action.as_pointer(),
+            slot.as_pointer() if slot is not None else 0,
+        )
+        if binding in seen:
+            continue
+        seen.add(binding)
+
+        for fc in _skv_iter_bound_fcurves(action, slot):
+            name = paths.get(fc.data_path)
+
+            if name is not None and len(fc.keyframe_points) > 0:
+                result.add(name)
+
+    return result

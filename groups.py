@@ -29,11 +29,13 @@ from .common import (
     kd_clear_selected,
     count_keys_in_group,
     ensure_init_setup_write,
-    InternalValueChangeGuard,
     skv_shape_key_list_sync_active,
     skv_sync_shape_key_list_indices,
     kd_group_map,
     kd_autokf_get_entry as _autokf_get_entry,
+    kd_favorite_names,
+    skv_list_key_names,
+    kd_activate_selection_source,
 )
 
 
@@ -307,16 +309,6 @@ class SKV_KeyGroupEntry(PropertyGroup):
     name: StringProperty(name="Key Name", default="")
     group: StringProperty(name="Group", default=INIT_GROUP_NAME)
 
-
-class SKV_KeyDefaultEntry(PropertyGroup):
-    name: StringProperty(name="Key Name", default="")
-    value: FloatProperty(name="Default Value", default=0.0)
-
-
-class SKV_ActiveKeyEntry(PropertyGroup):
-    name: StringProperty(name="Key Name", default="")
-
-
 class SKV_AutoKeyframeEntry(PropertyGroup):
     name: StringProperty(name="Key Name", default="")
     enabled: BoolProperty(name="Enabled", default=False)
@@ -340,61 +332,11 @@ def group_index_update(self, context):
     except Exception:
         pass
 
-    try:
-        key_data.skv_selected.clear()
-    except Exception:
-        pass
+    # Group navigation must preserve selection owned by Favorites.
+    if getattr(key_data, "skv_selection_source", "GROUP") == "GROUP":
+        kd_clear_selected(key_data)
 
     tag_redraw_view3d(context)
-
-
-def active_keys_index_update(self, context):
-    # Sync Active Shape Keys list selection to all shape key lists.
-    if skv_shape_key_list_sync_active():
-        return
-
-    key_data = self
-    if not key_data or not hasattr(key_data, "skv_active_keys"):
-        return
-
-    idx = int(getattr(key_data, "skv_active_keys_index", -1))
-    if idx < 0 or idx >= len(key_data.skv_active_keys):
-        return
-
-    key_name = key_data.skv_active_keys[idx].name
-    if not key_name:
-        return
-
-    obj = None
-
-    # Prefer current addon-picked object if it owns this Key datablock.
-    try:
-        props = getattr(context.scene, "skv_props", None)
-        picked = getattr(props, "object_pick", None) if props else None
-        if picked and get_shape_key_data(picked) is key_data:
-            obj = picked
-    except Exception:
-        obj = None
-
-    # Fallback: find mesh object that owns this Key datablock.
-    if obj is None:
-        try:
-            for candidate in bpy.data.objects:
-                if getattr(candidate, "type", None) == "MESH" and get_shape_key_data(candidate) is key_data:
-                    obj = candidate
-                    break
-        except Exception:
-            obj = None
-
-    if not obj:
-        return
-
-    skv_sync_shape_key_list_indices(
-        context,
-        obj,
-        key_name,
-        set_blender_active=True,
-    )
 
 def _shape_key_value_data_path(key_name: str) -> str:
     # Build a valid RNA path for a shape key value FCurve.
@@ -793,9 +735,25 @@ class SKV_UL_key_blocks(UIList):
         key_data = data
         row = layout.row(align=True)
 
-        icon_id = "CHECKBOX_HLT" if kd_is_selected(key_data, kb.name) else "CHECKBOX_DEHLT"
-        op = row.operator("skv.key_toggle_select", text="", icon=icon_id, emboss=False)
+        source = {
+            "SKV_UL_favorites": "FAVORITES",
+            "SKV_UL_keyframed_keys": "KEYFRAMED",
+            "SKV_UL_quick_shape_keys": "QUICK",
+        }.get(self.bl_idname, "GROUP")
+        selected = (
+                key_data.skv_selection_source == source
+                and kd_is_selected(key_data, kb.name)
+        )
+        icon_id = "CHECKBOX_HLT" if selected else "CHECKBOX_DEHLT"
+
+        op = row.operator(
+            "skv.key_toggle_select",
+            text="",
+            icon=icon_id,
+            emboss=False,
+        )
         op.key_index = index
+        op.source = source
 
         row.prop(kb, "name", text="", emboss=False)
         row.prop(kb, "value", text="", slider=True)
@@ -804,47 +762,67 @@ class SKV_UL_key_blocks(UIList):
         opv = row.operator("skv.shape_key_toggle_visibility", text="", icon=vis_icon, emboss=False)
         opv.key_name = kb.name
 
+        if source != "KEYFRAMED":
+            favorite = kb.name in kd_favorite_names(key_data)
+
+            opf = row.operator(
+                "skv.favorite_toggle",
+                text="",
+                icon="SOLO_ON" if favorite else "SOLO_OFF",
+                emboss=False,
+            )
+            opf.key_name = kb.name
+
         entry = _autokf_get_entry(key_data, kb.name, create=False)
         kf_enabled = bool(entry.enabled) if entry else False
-        kf_icon = "KEYFRAME_HLT" if kf_enabled else "KEYFRAME"
-        opk = row.operator("skv.auto_keyframe_toggle", text="", icon=kf_icon, emboss=False)
+        opk = row.operator(
+            "skv.auto_keyframe_toggle",
+            text="",
+            icon="KEYINGSET",
+            emboss=True,
+            depress=kf_enabled,
+        )
         opk.key_name = kb.name
 
+class SKV_UL_favorites(UIList):
+    bl_idname = "SKV_UL_favorites"
 
-class SKV_UL_active_keys(UIList):
-    bl_idname = "SKV_UL_active_keys"
+    def filter_items(self, context, data, propname):
+        names = set(
+            skv_list_key_names(
+                data,
+                context.scene.skv_props,
+                "FAVORITES",
+            )
+        )
 
-    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        key_data = data
-        entry = item
-        kname = entry.name
+        return [
+            self.bitflag_filter_item if kb.name in names else 0
+            for kb in getattr(data, propname)
+        ], []
 
-        row = layout.row(align=True)
-
-        kb = None
-        try:
-            kb = key_data.key_blocks.get(kname) if kname else None
-        except Exception:
-            kb = None
-
-        if kb:
-            row.prop(kb, "name", text="", emboss=False)
-            row.prop(kb, "value", text="", slider=True)
-
-            vis_icon = "HIDE_ON" if kb.mute else "HIDE_OFF"
-            opv = row.operator("skv.shape_key_toggle_visibility", text="", icon=vis_icon, emboss=False)
-            opv.key_name = kname
-
-            entry_kf = _autokf_get_entry(key_data, kname, create=False)
-            kf_enabled = bool(entry_kf.enabled) if entry_kf else False
-            kf_icon = "KEYFRAME_HLT" if kf_enabled else "KEYFRAME"
-            opk = row.operator("skv.auto_keyframe_toggle", text="", icon=kf_icon, emboss=False)
-            opk.key_name = kname
-        else:
-            row.label(text=kname or "Invalid", icon="ERROR")
-
-        op = row.operator("skv.active_key_remove", text="", icon="REMOVE", emboss=False)
-        op.key_name = kname
+    def draw_item(
+        self,
+        context,
+        layout,
+        data,
+        item,
+        icon,
+        active_data,
+        active_propname,
+        index,
+    ):
+        SKV_UL_key_blocks.draw_item(
+            self,
+            context,
+            layout,
+            data,
+            item,
+            icon,
+            active_data,
+            active_propname,
+            index,
+        )
 
 
 # -----------------------------
@@ -866,7 +844,10 @@ class SKV_MT_MoveToGroup(Menu):
 
         has_target_groups = False
         for g in key_data.skv_groups:
-            if g.name == current_group:
+            if (
+                    key_data.skv_selection_source == "GROUP"
+                    and g.name == current_group
+            ):
                 continue
             has_target_groups = True
             op = layout.operator("skv.move_selected_to_group", text=g.name, icon="FILE_FOLDER")
@@ -888,67 +869,6 @@ class SKV_MT_SelectActions(Menu):
 # -----------------------------
 # Operators (required by CLASSES)
 # -----------------------------
-class SKV_OT_ActiveKeyRemove(Operator):
-    bl_idname = "skv.active_key_remove"
-    bl_label = "Remove From Active"
-    bl_options = {"REGISTER", "UNDO"}
-
-    key_name: StringProperty(name="Key Name", default="")
-
-    @classmethod
-    def poll(cls, context):
-        obj = get_active_object(context)
-        key_data = get_shape_key_data(obj) if obj else None
-        return bool(key_data and hasattr(key_data, "skv_active_keys") and hasattr(key_data, "skv_key_defaults"))
-
-    def execute(self, context):
-        obj = get_active_object(context)
-        key_data = get_shape_key_data(obj) if obj else None
-        if not obj or not key_data:
-            return {"CANCELLED"}
-
-        name = (self.key_name or "").strip()
-        if not name:
-            return {"CANCELLED"}
-
-        try:
-            i = 0
-            while i < len(key_data.skv_active_keys):
-                if key_data.skv_active_keys[i].name == name:
-                    key_data.skv_active_keys.remove(i)
-                    break
-                i += 1
-        except Exception:
-            pass
-
-        try:
-            kb = key_data.key_blocks.get(name)
-        except Exception:
-            kb = None
-
-        if kb is not None and hasattr(key_data, "skv_key_defaults"):
-            try:
-                cur_val = float(kb.value)
-            except Exception:
-                cur_val = 0.0
-
-            try:
-                updated = False
-                for it in key_data.skv_key_defaults:
-                    if it.name == name:
-                        it.value = cur_val
-                        updated = True
-                        break
-                if not updated:
-                    it = key_data.skv_key_defaults.add()
-                    it.name = name
-                    it.value = cur_val
-            except Exception:
-                pass
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
-
 
 class SKV_OT_ShapeKeyToggleVisibility(Operator):
     bl_idname = "skv.shape_key_toggle_visibility"
@@ -1021,81 +941,106 @@ class SKV_OT_KeyToggleSelect(Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     key_index: IntProperty(name="Key Index", default=-1)
+    source: StringProperty(name="List Source", default="GROUP")
 
     def execute(self, context):
-        obj = get_active_object(context)
-        if not obj:
+        data = get_shape_key_data(get_active_object(context))
+
+        if not data or not data.key_blocks or data.library is not None:
             return {"CANCELLED"}
 
-        key_data = get_shape_key_data(obj)
-        if not key_data or not getattr(key_data, "key_blocks", None):
+        if self.source not in {
+            "GROUP",
+            "FAVORITES",
+            "KEYFRAMED",
+            "QUICK",
+        }:
             return {"CANCELLED"}
 
-        idx = int(self.key_index)
-        if not (0 <= idx < len(key_data.key_blocks)):
+        if not 0 <= self.key_index < len(data.key_blocks):
             return {"CANCELLED"}
 
-        kb = key_data.key_blocks[idx]
-        if kb.name == "Basis":
+        kb = data.key_blocks[self.key_index]
+        names = skv_list_key_names(
+            data,
+            context.scene.skv_props,
+            self.source,
+        )
+        if kb.name not in names:
             return {"CANCELLED"}
 
-        kd_set_selected(key_data, kb.name, not kd_is_selected(key_data, kb.name))
+        # Clear the other list before toggling the requested key.
+        kd_activate_selection_source(data, self.source)
+        kd_set_selected(
+            data,
+            kb.name,
+            not kd_is_selected(data, kb.name),
+        )
+
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
 
+def _select_visible_from_list(operator, context, source):
+    data = get_shape_key_data(get_active_object(context))
+
+    if not data or not data.key_blocks or data.library is not None:
+        return {"CANCELLED"}
+
+    if not is_initialized(data):
+        return {"CANCELLED"}
+
+    if operator.mode not in {"ALL", "CLEAR", "INVERT"}:
+        return {"CANCELLED"}
+
+    names = skv_list_key_names(
+        data,
+        context.scene.skv_props,
+        source,
+    )
+
+    if operator.mode == "CLEAR":
+        # Deselect only entries owned by this list.
+        if data.skv_selection_source == source:
+            for name in names:
+                kd_set_selected(data, name, False)
+
+    elif names:
+        # Activating this list clears selection in the other list.
+        kd_activate_selection_source(data, source)
+
+        for name in names:
+            state = (
+                True
+                if operator.mode == "ALL"
+                else not kd_is_selected(data, name)
+            )
+            kd_set_selected(data, name, state)
+
+    tag_redraw_view3d(context)
+    return {"FINISHED"}
+
+
 class SKV_OT_SelectVisible(Operator):
     bl_idname = "skv.select_visible"
-    bl_label = "Select Visible"
+    bl_label = "Select Group Keys"
     bl_options = {"REGISTER", "UNDO"}
 
     mode: StringProperty(name="Mode", default="ALL")
 
     def execute(self, context):
-        obj = get_active_object(context)
-        if not obj:
-            return {"CANCELLED"}
+        return _select_visible_from_list(self, context, "GROUP")
 
-        key_data = get_shape_key_data(obj)
-        if not key_data or not key_data.key_blocks:
-            return {"CANCELLED"}
 
-        if not is_initialized(key_data):
-            self.report({"INFO"}, "Not initialized.")
-            return {"CANCELLED"}
+class SKV_OT_FavoritesSelectVisible(Operator):
+    bl_idname = "skv.favorites_select_visible"
+    bl_label = "Select Favorite Keys"
+    bl_options = {"REGISTER", "UNDO"}
 
-        props = context.scene.skv_props
-        group_name = get_selected_group_name(key_data)
-        search_tokens = [t.lower() for t in parse_tokens(getattr(props, "search", ""))]
+    mode: StringProperty(name="Mode", default="ALL")
 
-        visible_names = []
-        for kb in key_data.key_blocks:
-            if kb.name == "Basis":
-                continue
-            if kd_get_group(key_data, kb.name) != group_name:
-                continue
-
-            if search_tokens:
-                name_l = kb.name.lower()
-                if any(tok not in name_l for tok in search_tokens):
-                    continue
-
-            visible_names.append(kb.name)
-
-        if self.mode == "ALL":
-            for n in visible_names:
-                kd_set_selected(key_data, n, True)
-
-        elif self.mode == "CLEAR":
-            for n in visible_names:
-                kd_set_selected(key_data, n, False)
-
-        elif self.mode == "INVERT":
-            for n in visible_names:
-                kd_set_selected(key_data, n, not kd_is_selected(key_data, n))
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
+    def execute(self, context):
+        return _select_visible_from_list(self, context, "FAVORITES")
 
 
 # class SKV_OT_SelectByAffix(Operator):
@@ -1182,15 +1127,15 @@ class SKV_OT_ResetGroupValues(Operator):
 
     def execute(self, context):
         obj = get_active_object(context)
-        if not obj:
+        key_data = get_shape_key_data(obj) if obj else None
+        if not obj or not key_data or not key_data.key_blocks:
             return {"CANCELLED"}
 
-        key_data = get_shape_key_data(obj)
-        if not key_data or not key_data.key_blocks:
-            return {"CANCELLED"}
-
-        if getattr(key_data, "library", None) is not None:
-            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
+        if key_data.library is not None:
+            self.report(
+                {"ERROR"},
+                "Shape key datablock is linked (read-only).",
+            )
             return {"CANCELLED"}
 
         if not is_initialized(key_data):
@@ -1199,64 +1144,31 @@ class SKV_OT_ResetGroupValues(Operator):
 
         ensure_init_setup_write(obj)
 
-        group_name = get_selected_group_name(key_data)
         selected = kd_selected_set(key_data)
-
-        if not selected:
-            self.report({"INFO"}, "No selected shape keys.")
-            return {"CANCELLED"}
-
-        preexisting_active = set()
-        try:
-            if hasattr(key_data, "skv_active_keys"):
-                preexisting_active = {it.name for it in key_data.skv_active_keys if it.name}
-        except Exception:
-            preexisting_active = set()
+        group_name = get_selected_group_name(key_data)
+        mapping = kd_group_map(key_data)
+        fallback = get_fallback_group_name(key_data)
+        basis_name = key_data.key_blocks[0].name
 
         changed = 0
-        with InternalValueChangeGuard():
-            for kb in key_data.key_blocks:
-                if kb.name not in selected:
-                    continue
-                if kd_get_group(key_data, kb.name) != group_name:
-                    continue
+        for kb in key_data.key_blocks:
+            if kb.name == basis_name or kb.name not in selected:
+                continue
+            if (
+                    key_data.skv_selection_source == "GROUP"
+                    and mapping.get(kb.name, fallback) != group_name
+            ):
+                continue
 
-                try:
+            try:
+                if float(kb.value) != 0.0:
                     kb.value = 0.0
-                except Exception:
-                    continue
-
-                try:
-                    if hasattr(key_data, "skv_key_defaults"):
-                        updated = False
-                        for d in key_data.skv_key_defaults:
-                            if d.name == kb.name:
-                                d.value = 0.0
-                                updated = True
-                                break
-                        if not updated:
-                            d = key_data.skv_key_defaults.add()
-                            d.name = kb.name
-                            d.value = 0.0
-                except Exception:
-                    pass
-
-                if kb.name not in preexisting_active:
-                    try:
-                        if hasattr(key_data, "skv_active_keys"):
-                            i = 0
-                            while i < len(key_data.skv_active_keys):
-                                if key_data.skv_active_keys[i].name == kb.name:
-                                    key_data.skv_active_keys.remove(i)
-                                else:
-                                    i += 1
-                    except Exception:
-                        pass
-
                 changed += 1
+            except RuntimeError:
+                continue
 
         if changed == 0:
-            self.report({"INFO"}, "No keys were reset.")
+            self.report({"INFO"}, "No selected keys were reset.")
             return {"CANCELLED"}
 
         kd_clear_selected(key_data)
@@ -1305,8 +1217,7 @@ class SKV_OT_DeleteSelectedShapeKeys(Operator):
 
         active_name = obj.active_shape_key.name if obj.active_shape_key else ""
         deleted = set()
-        with InternalValueChangeGuard():
-            for name in reversed(names):
+        for name in reversed(names):
                 kb = key_data.key_blocks.get(name)
                 if kb is None:
                     continue
@@ -1324,8 +1235,6 @@ class SKV_OT_DeleteSelectedShapeKeys(Operator):
         for attr in (
             "skv_key_groups",
             "skv_selected",
-            "skv_key_defaults",
-            "skv_active_keys",
             "skv_auto_keyframes",
         ):
             collection = getattr(key_data, attr, None)
@@ -1757,8 +1666,7 @@ class SKV_OT_TransferTo(Operator):
 
         target_key_data = get_shape_key_data(target)
         if target_key_data and getattr(target_key_data, "key_blocks", None):
-            with InternalValueChangeGuard():
-                for key_name in selected_names:
+            for key_name in selected_names:
                     src_kb = key_data.key_blocks.get(key_name)
                     dst_kb = target_key_data.key_blocks.get(key_name)
                     if not src_kb or not dst_kb:
@@ -1883,8 +1791,7 @@ class SKV_OT_TransferFrom(Operator):
 
         target_key_data = get_shape_key_data(target)
         if target_key_data and getattr(target_key_data, "key_blocks", None):
-            with InternalValueChangeGuard():
-                for key_name in selected_names:
+            for key_name in selected_names:
                     src_kb = source_key_data.key_blocks.get(key_name)
                     dst_kb = target_key_data.key_blocks.get(key_name)
                     if not src_kb or not dst_kb:
@@ -1922,23 +1829,200 @@ class SKV_OT_TransferFrom(Operator):
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
+class SKV_OT_FavoriteToggle(Operator):
+    bl_idname = "skv.favorite_toggle"
+    bl_label = "Add / Remove Favorite"
+    bl_description = "Add this shape key to Favorites or remove it"
+    bl_options = {"REGISTER", "UNDO"}
+
+    key_name: StringProperty(name="Key Name", default="")
+
+    def invoke(self, context, event):
+        data = get_shape_key_data(get_active_object(context))
+
+        if not data or not data.key_blocks or data.library is not None:
+            return {"CANCELLED"}
+
+        if self.key_name in kd_favorite_names(data):
+            return context.window_manager.invoke_props_dialog(
+                self,
+                width=360,
+            )
+
+        return self.execute(context)
+
+    def draw(self, context):
+        self.layout.label(
+            text="Remove this shape key from Favorites?",
+            icon="QUESTION",
+        )
+        self.layout.label(text=self.key_name)
+
+    def execute(self, context):
+        data = get_shape_key_data(get_active_object(context))
+
+        if not data or not data.key_blocks or data.library is not None:
+            return {"CANCELLED"}
+
+        kb = data.key_blocks.get(self.key_name)
+        if kb is None or kb == data.key_blocks[0]:
+            return {"CANCELLED"}
+
+        entries = data.skv_favorites
+        indices = [
+            index
+            for index, item in enumerate(entries)
+            if item.name == kb.name
+        ]
+
+        if indices:
+            for index in reversed(indices):
+                entries.remove(index)
+
+            if data.skv_selection_source == "FAVORITES":
+                kd_set_selected(data, kb.name, False)
+        else:
+            entries.add().name = kb.name
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+
+class SKV_OT_FavoritesClear(Operator):
+    bl_idname = "skv.favorites_clear"
+    bl_label = "Clear Favorites"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(
+            self,
+            width=340,
+        )
+
+    def draw(self, context):
+        self.layout.label(
+            text="Remove all entries from Favorites?",
+            icon="QUESTION",
+        )
+
+    def execute(self, context):
+        data = get_shape_key_data(get_active_object(context))
+
+        if not data or data.library is not None:
+            return {"CANCELLED"}
+
+        data.skv_favorites.clear()
+
+        if data.skv_selection_source == "FAVORITES":
+            kd_clear_selected(data)
+
+        context.scene.skv_props.favorites_index = -1
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+
+class SKV_OT_FavoritesSearchClear(Operator):
+    bl_idname = "skv.favorites_search_clear"
+    bl_label = "Clear Favorites Search"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        props = context.scene.skv_props
+        props.favorites_search = ""
+        props.favorites_index = -1
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+class SKV_UL_keyframed_keys(UIList):
+    bl_idname = "SKV_UL_keyframed_keys"
+
+    def filter_items(self, context, data, propname):
+        names = set(
+            skv_list_key_names(
+                data,
+                context.scene.skv_props,
+                "KEYFRAMED",
+            )
+        )
+
+        return [
+            self.bitflag_filter_item if kb.name in names else 0
+            for kb in getattr(data, propname)
+        ], []
+
+    def draw_item(
+        self,
+        context,
+        layout,
+        data,
+        item,
+        icon,
+        active_data,
+        active_propname,
+        index,
+    ):
+        SKV_UL_key_blocks.draw_item(
+            self,
+            context,
+            layout,
+            data,
+            item,
+            icon,
+            active_data,
+            active_propname,
+            index,
+        )
+
+
+class SKV_OT_KeyframedSelectVisible(Operator):
+    bl_idname = "skv.keyframed_select_visible"
+    bl_label = "Select Keyframed Shape Keys"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mode: StringProperty(name="Mode", default="ALL")
+
+    def execute(self, context):
+        return _select_visible_from_list(
+            self,
+            context,
+            "KEYFRAMED",
+        )
+
+
+class SKV_OT_KeyframedSearchClear(Operator):
+    bl_idname = "skv.keyframed_search_clear"
+    bl_label = "Clear Keyframed Search"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        props = context.scene.skv_props
+        props.keyframed_search = ""
+        props.keyframed_index = -1
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+
 CLASSES = (
     SKV_Group,
     SKV_SelectedName,
     SKV_KeyGroupEntry,
-    SKV_KeyDefaultEntry,
-    SKV_ActiveKeyEntry,
     SKV_AutoKeyframeEntry,
     SKV_UL_Groups,
     SKV_UL_key_blocks,
-    SKV_UL_active_keys,
+    SKV_UL_favorites,
+    SKV_OT_FavoriteToggle,
+    SKV_OT_FavoritesClear,
+    SKV_OT_FavoritesSearchClear,
     SKV_MT_MoveToGroup,
     SKV_MT_SelectActions,
-    SKV_OT_ActiveKeyRemove,
     SKV_OT_ShapeKeyToggleVisibility,
     SKV_OT_AutoKeyframeToggle,
     SKV_OT_KeyToggleSelect,
     SKV_OT_SelectVisible,
+    SKV_OT_FavoritesSelectVisible,
     # SKV_OT_SelectByAffix,
     SKV_OT_MoveSelectedToGroup,
     SKV_OT_ResetGroupValues,
@@ -1950,4 +2034,7 @@ CLASSES = (
     SKV_OT_CreateGroupFromSelected,
     SKV_OT_TransferTo,
     SKV_OT_TransferFrom,
+    SKV_UL_keyframed_keys,
+    SKV_OT_KeyframedSelectVisible,
+    SKV_OT_KeyframedSearchClear,
 )

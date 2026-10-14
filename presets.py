@@ -603,7 +603,6 @@ class SKV_OT_preset_object_transfer(Operator):
             inherit_transferred_groups,
             inherit_transferred_keyframes,
         )
-        from .common import InternalValueChangeGuard
 
         scene = context.scene
         index = int(self.preset_index)
@@ -679,9 +678,7 @@ class SKV_OT_preset_object_transfer(Operator):
                 vertex_group=None,
             )
             try:
-                # Reuse the projection cache and track success per key.
-                with InternalValueChangeGuard():
-                    for name in missing:
+                for name in missing:
                         if transfer.transfer_shape_keys(shapekey_names=[name]):
                             created.append(name)
                         else:
@@ -708,8 +705,7 @@ class SKV_OT_preset_object_transfer(Operator):
 
         # Existing target geometry, values and groups are preserved.
         # Synchronize values for both new and existing target keys.
-        with InternalValueChangeGuard():
-            for name in resolved:
+        for name in resolved:
                 target_data.key_blocks[name].value = (
                     source_data.key_blocks[name].value
                 )
@@ -853,8 +849,13 @@ class SKV_UL_global_presets(UIList):
         opv = row.operator("skv.preset_toggle_visibility", text="", icon=vis_icon, emboss=False)
         opv.preset_index = index
 
-        kf_icon = "KEYFRAME_HLT" if _preset_all_autokey_enabled(preset) else "KEYFRAME"
-        opk = row.operator("skv.preset_toggle_auto_keyframe", text="", icon=kf_icon, emboss=False)
+        opk = row.operator(
+            "skv.preset_toggle_auto_keyframe",
+            text="",
+            icon="KEYINGSET",
+            emboss=True,
+            depress=_preset_all_autokey_enabled(preset),
+        )
         opk.preset_index = index
 
 
