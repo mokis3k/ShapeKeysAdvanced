@@ -8,6 +8,8 @@ bl_info = {
     "category": "Object",
 }
 
+import os
+import bpy.utils.previews
 import bpy
 from bpy.app.handlers import persistent
 from bpy.types import Operator, Panel, PropertyGroup, UIList
@@ -47,6 +49,43 @@ from . import groups
 from . import presets
 from . import transfer
 
+_SKV_CUSTOM_ICONS = None
+
+
+def _unregister_custom_icons():
+    global _SKV_CUSTOM_ICONS
+
+    if _SKV_CUSTOM_ICONS is not None:
+        bpy.utils.previews.remove(_SKV_CUSTOM_ICONS)
+        _SKV_CUSTOM_ICONS = None
+
+
+def _register_custom_icons():
+    global _SKV_CUSTOM_ICONS
+
+    _unregister_custom_icons()
+
+    path = os.path.join(
+        os.path.dirname(__file__),
+        "icons",
+        "icon.jpg",
+    )
+    if not os.path.isfile(path):
+        return
+
+    collection = bpy.utils.previews.new()
+
+    try:
+        collection.load("object", path, "IMAGE")
+
+    except (OSError, RuntimeError, ValueError) as error:
+        bpy.utils.previews.remove(collection)
+        print(
+            f"ShapeKeysAdvanced: cannot load object icon: {error}"
+        )
+        return
+
+    _SKV_CUSTOM_ICONS = collection
 
 def _poll_mesh_object(self, obj):
     # Accept only mesh objects.
@@ -571,84 +610,95 @@ class SKV_OT_QuickShapeKeyAdd(Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = getattr(context.scene.skv_props, "object_pick", None) if hasattr(context.scene, "skv_props") else None
-        return bool(obj and getattr(obj, "type", None) == "MESH")
+        scene = getattr(context, "scene", None)
+        props = getattr(scene, "skv_props", None) if scene else None
+        obj = getattr(props, "object_pick", None) if props else None
+
+        return bool(obj and obj.type == "MESH")
 
     def execute(self, context):
+        from .common import ensure_init_setup_write
+
         props = context.scene.skv_props
-        obj = getattr(props, "object_pick", None)
-        if not obj or getattr(obj, "type", None) != "MESH":
+        obj = props.object_pick
+
+        if not obj or obj.type != "MESH":
             return {"CANCELLED"}
 
-        key_data = get_shape_key_data(obj)
-        if key_data and getattr(key_data, "library", None) is not None:
-            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
+        data = get_shape_key_data(obj)
+
+        if obj.data.library is not None or (
+            data is not None and data.library is not None
+        ):
+            self.report(
+                {"ERROR"},
+                "Target data is linked (read-only).",
+            )
             return {"CANCELLED"}
 
-        view_layer = context.view_layer
-        try:
-            view_layer.objects.active = obj
-        except Exception:
-            pass
+        if data is not None:
+            ensure_init_setup_write(obj)
+
+        # Capture the selected group before creation triggers handlers.
+        target_group = (
+            get_selected_group_name(data)
+            if data
+            else INIT_GROUP_NAME
+        )
 
         try:
-            obj.select_set(True)
-        except Exception:
-            pass
-
-        if context.mode != "OBJECT":
-            try:
+            if context.mode != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
-            except Exception:
-                pass
 
-        # Ensure Basis exists.
-        if not get_shape_key_data(obj):
-            obj.shape_key_add(name="Basis", from_mix=False)
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
 
-        key_data = get_shape_key_data(obj)
-        new_name = _next_quick_shape_key_name(key_data)
+        except RuntimeError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
 
-        # Add new shape key.
-        new_kb = obj.shape_key_add(name=new_name, from_mix=False)
-        key_data = get_shape_key_data(obj)
-
-        if key_data and getattr(key_data, "key_blocks", None):
-            try:
-                current_group = get_selected_group_name(key_data) or INIT_GROUP_NAME
-                kd_set_group(key_data, new_kb.name, current_group)
-            except Exception:
-                pass
-
-            try:
-                skv_sync_shape_key_list_indices(
-                    context,
-                    obj,
-                    new_kb.name,
-                    set_blender_active=True,
-                )
-            except Exception:
-                try:
-                    obj.active_shape_key_index = len(key_data.key_blocks) - 1
-                    props.keys_index = len(key_data.key_blocks) - 1
-                    props.quick_keys_index = len(key_data.key_blocks) - 1
-                except Exception:
-                    pass
+        props.quick_shape_key_editing = False
+        props.quick_shape_key_name = ""
 
         try:
-            new_kb.value = 1.0
-        except Exception:
-            pass
+            if get_shape_key_data(obj) is None:
+                obj.shape_key_add(
+                    name="Basis",
+                    from_mix=False,
+                )
 
-        props.quick_shape_key_editing = True
-        props.quick_keys_open = True
+            ensure_init_setup_write(obj)
+
+            # Blender generates a unique name automatically.
+            new_kb = obj.shape_key_add(
+                name="Key",
+                from_mix=False,
+            )
+
+        except RuntimeError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
+        data = get_shape_key_data(obj)
+        kd_set_group(data, new_kb.name, target_group)
+
+        # Reveal the new key in the existing group list.
+        props.keys_open = True
+        props.search = ""
+
+        skv_sync_shape_key_list_indices(
+            context,
+            obj,
+            new_kb.name,
+            set_blender_active=True,
+        )
+
+        new_kb.value = 1.0
 
         try:
             bpy.ops.object.mode_set(mode="SCULPT")
-        except Exception:
-            props.quick_shape_key_editing = False
-            props.quick_shape_key_name = ""
 
+        except RuntimeError:
             self.report(
                 {"WARNING"},
                 "Shape key created, but failed to switch to Sculpt Mode.",
@@ -656,7 +706,6 @@ class SKV_OT_QuickShapeKeyAdd(Operator):
             tag_redraw_view3d(context)
             return {"FINISHED"}
 
-        # Mark editing only after Sculpt Mode has been entered.
         props.quick_shape_key_editing = True
         props.quick_shape_key_name = new_kb.name
 
@@ -1055,17 +1104,8 @@ class SKV_Props(PropertyGroup):
 
 def _draw_quick_shape_keys_block(layout, context, obj, key_data=None):
     props = context.scene.skv_props
-    quick_col = layout.column(align=True)
 
-    header = quick_col.row(align=True)
-    header.prop(
-        props,
-        "quick_keys_open",
-        text="",
-        emboss=False,
-        icon="TRIA_DOWN" if props.quick_keys_open else "TRIA_RIGHT",
-    )
-    header.label(text="Quick Shape Keys")
+    layout.separator()
 
     editing = (
         props.quick_shape_key_editing
@@ -1077,125 +1117,21 @@ def _draw_quick_shape_keys_block(layout, context, obj, key_data=None):
     )
 
     if editing:
-        quick_col.label(
-            text=f"Editing: {props.quick_shape_key_name}",
-        )
-        quick_col.operator(
+        layout.operator(
             "skv.quick_shape_key_fix",
             text="Fix",
             icon="CHECKMARK",
         )
     else:
-        quick_col.operator(
+        layout.operator(
             "skv.quick_shape_key_add",
-            text="Add Quick Shape Key",
+            text="Add Shape Key",
             icon="ADD",
         )
 
-    if not props.quick_keys_open:
-        return
-
-    if not obj:
-        quick_col.label(text="No selected object", icon="INFO")
-        return
-
-    if obj.type != "MESH":
-        quick_col.label(text="Active object is not a mesh", icon="INFO")
-        return
-
-    if key_data is None:
-        key_data = get_shape_key_data(obj)
-
-    quick_keys = _iter_quick_shape_keys(key_data)
-
-    if not quick_keys:
-        quick_col.label(text="No quick shape keys found", icon="INFO")
-        return
-
-    content = quick_col.column(align=True)
-    content.enabled = key_data.library is None
-
-    row = content.row(align=True)
-    row.prop(props, "quick_search", text="", icon="VIEWZOOM")
-    row.operator(
-        "skv.quick_search_clear",
-        text="",
-        icon="X",
-    )
-
-    row = content.row(align=True)
-
-    for label, mode in (
-        ("Select All", "ALL"),
-        ("Deselect", "CLEAR"),
-        ("Invert", "INVERT"),
-    ):
-        row.operator(
-            "skv.quick_select_visible",
-            text=label,
-        ).mode = mode
-
-    content.template_list(
-        "SKV_UL_quick_shape_keys",
-        "",
-        key_data,
-        "key_blocks",
-        props,
-        "quick_keys_index",
-        rows=max(1, min(len(quick_keys), 5)),
-    )
-
-    visible = set(
-        skv_list_key_names(key_data, props, "QUICK")
-    )
-
-    if (
-        key_data.skv_selection_source != "QUICK"
-        or not (visible & kd_selected_set(key_data))
-    ):
-        return
-
-    row = content.row(align=True)
-    row.menu(
-        "SKV_MT_move_to_group",
-        text="Move to group",
-        icon="FILE_FOLDER",
-    )
-    row.operator(
-        "skv.create_group_from_selected",
-        text="Create group",
-        icon="NEWFOLDER",
-    )
-
-    row = content.row(align=True)
-    presets_row = row.row(align=True)
-    presets_row.enabled = bool(context.scene.skv_global_presets)
-    presets_row.menu(
-        "SKV_MT_add_to_preset",
-        text="Add to preset",
-        icon="PRESET",
-    )
-    row.operator(
-        "skv.global_preset_add_from_selected",
-        text="Create preset",
-        icon="PRESET",
-    )
-
-    row = content.row(align=True)
-    row.operator(
-        "skv.reset_group_values",
-        text="Zero selected values",
-        icon="RECOVER_LAST",
-    )
-    row.operator(
-        "skv.transfer_to",
-        text="Transfer to...",
-        icon="EXPORT",
-    )
-
 
 class SKV_PT_ShapeKeysPanel(Panel):
-    bl_label = "Object"
+    bl_label = "Shape Keys Manager"
     bl_idname = "SKV_PT_shape_keys_viewer_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -1203,10 +1139,25 @@ class SKV_PT_ShapeKeysPanel(Panel):
     bl_order = 0
 
     def draw_header(self, context):
-        self.layout.label(text="", icon="OBJECT_DATA")
+        icon = (
+            _SKV_CUSTOM_ICONS.get("object")
+            if _SKV_CUSTOM_ICONS is not None
+            else None
+        )
+
+        if icon is not None and icon.icon_id:
+            self.layout.label(
+                text="",
+                icon_value=icon.icon_id,
+            )
+        else:
+            self.layout.label(
+                text="",
+                icon="OBJECT_DATA",
+            )
 
     def draw(self, context):
-        layout = self.layout
+        layout = self.layout.column(align=True)
         props = context.scene.skv_props
         obj = getattr(props, "object_pick", None)
 
@@ -1362,7 +1313,7 @@ class SKV_PT_FavoritesPanel(Panel):
         self.layout.label(text="", icon="SOLO_ON")
 
     def draw(self, context):
-        layout = self.layout
+        layout = self.layout.column(align=True)
         props = context.scene.skv_props
         obj = props.object_pick
         data = get_shape_key_data(obj)
@@ -1384,21 +1335,19 @@ class SKV_PT_FavoritesPanel(Panel):
         layout.enabled = data.library is None
 
         row = layout.row(align=True)
-        row.prop(props, "favorites_search", text="", icon="VIEWZOOM")
+        row.prop(
+            props,
+            "favorites_search",
+            text="",
+            icon="VIEWZOOM",
+        )
         row.operator(
             "skv.favorites_search_clear",
             text="",
             icon="X",
         )
 
-        count = len(kd_favorite_names(data))
-
-        if count == 0:
-            layout.label(text="No favorites found", icon="INFO")
-            return
-
         row = layout.row(align=True)
-
         row.operator(
             "skv.favorites_select_visible",
             text="Select All",
@@ -1409,7 +1358,15 @@ class SKV_PT_FavoritesPanel(Panel):
             text="Deselect",
         ).mode = "CLEAR"
 
-        row.operator("skv.favorites_clear", text="Clear")
+        row.operator(
+            "skv.favorites_select_visible",
+            text="Invert",
+        ).mode = "INVERT"
+
+        layout.operator(
+            "skv.favorites_clear",
+            text="Clear",
+        )
 
         layout.template_list(
             "SKV_UL_favorites",
@@ -1421,7 +1378,10 @@ class SKV_PT_FavoritesPanel(Panel):
             rows=max(1, min(count, 5)),
         )
 
-        visible = set(skv_list_key_names(data, props, "FAVORITES"))
+        visible = set(
+            skv_list_key_names(data, props, "FAVORITES")
+        )
+
         if (
             data.skv_selection_source != "FAVORITES"
             or not (visible & kd_selected_set(data))
@@ -1441,6 +1401,7 @@ class SKV_PT_FavoritesPanel(Panel):
         )
 
         row = layout.row(align=True)
+
         presets_row = row.row(align=True)
         presets_row.enabled = bool(context.scene.skv_global_presets)
         presets_row.menu(
@@ -1448,6 +1409,7 @@ class SKV_PT_FavoritesPanel(Panel):
             text="Add to preset",
             icon="PRESET",
         )
+
         row.operator(
             "skv.global_preset_add_from_selected",
             text="Create preset",
@@ -1461,6 +1423,12 @@ class SKV_PT_FavoritesPanel(Panel):
             icon="RECOVER_LAST",
         )
         row.operator(
+            "skv.delete_selected_shape_keys",
+            text="Delete selected",
+            icon="TRASH",
+        )
+
+        layout.operator(
             "skv.transfer_to",
             text="Transfer to...",
             icon="EXPORT",
@@ -1735,26 +1703,221 @@ class SKV_OT_QuickSearchClear(Operator):
         return {"FINISHED"}
 
 _LOCAL_CLASSES = (
-    SKV_UL_quick_shape_keys,
     SKV_OT_SearchClear,
     SKV_OT_SynchronizeValues,
     SKV_OT_QuickShapeKeyAdd,
-    SKV_OT_QuickShapeKeyDelete,
     SKV_OT_QuickShapeKeyFix,
     SKV_Props,
     SKV_PT_ShapeKeysPanel,
     SKV_PT_FavoritesPanel,
     SKV_PT_KeyframedPanel,
     SKV_PT_PresetsPanel,
-    SKV_OT_QuickSelectVisible,
-    SKV_OT_QuickSearchClear,
 )
 
 _ALL_CLASSES = _LOCAL_CLASSES + groups.CLASSES + presets.CLASSES + transfer.CLASSES
 
 
+_SKV_OPERATOR_DESCRIPTIONS = {
+    "skv.search_clear":
+        "Clear the search filter in the current group",
+
+    "skv.synchronize_values":
+        "Copy matching shape key values from the source mesh to this object",
+
+    "skv.quick_shape_key_add":
+        "Create a shape key in the current group and enter Sculpt Mode",
+
+    "skv.quick_shape_key_fix":
+        "Finish editing the shape key and return to Object Mode",
+
+    "skv.quick_shape_key_delete":
+        "Delete this shape key from the object",
+
+    "skv.active_key_remove":
+        "Remove this entry from Active Shape Keys without deleting the shape key",
+
+    "skv.shape_key_toggle_visibility":
+        "Enable or disable this shape key's contribution to the mesh",
+
+    "skv.auto_keyframe_toggle":
+        "Enable or disable automatic keyframes for this shape key",
+
+    "skv.key_toggle_select":
+        "Select or deselect this shape key for list actions",
+
+    "skv.select_visible":
+        "Change selection in the current group",
+
+    "skv.favorites_select_visible":
+        "Change selection in Favorites",
+
+    "skv.keyframed_select_visible":
+        "Change selection in Keyframed Shape Keys",
+
+    "skv.quick_select_visible":
+        "Change selection in this list",
+
+    "skv.move_selected_to_group":
+        "Move selected shape keys to the chosen group",
+
+    "skv.reset_group_values":
+        "Set the selected shape key values to zero",
+
+    "skv.delete_selected_shape_keys":
+        "Delete the selected shape keys from the object after confirmation",
+
+    "skv.group_add":
+        "Create an empty shape key group",
+
+    "skv.group_remove":
+        "Remove this group and move its shape keys to another group",
+
+    "skv.group_move":
+        "Move this group up or down in the group list",
+
+    "skv.group_rename":
+        "Rename the selected group",
+
+    "skv.create_group_from_selected":
+        "Create a group and move the selected shape keys into it",
+
+    "skv.transfer_to":
+        "Transfer selected shape keys to another mesh",
+
+    "skv.transfer_from":
+        "Transfer all non-Basis shape keys from another mesh to this object",
+
+    "skv.favorite_toggle":
+        "Add this shape key to Favorites or remove it",
+
+    "skv.favorites_clear":
+        "Remove all entries from Favorites after confirmation; keep the shape keys",
+
+    "skv.favorites_search_clear":
+        "Clear the Favorites search filter",
+
+    "skv.keyframed_search_clear":
+        "Clear the Keyframed Shape Keys search filter",
+
+    "skv.quick_search_clear":
+        "Clear the search filter in this list",
+
+    "skv.preset_capture_max_index":
+        "Save current shape key values as reference values for this preset",
+
+    "skv.preset_item_capture_max":
+        "Save this shape key's current value as its reference value in the preset",
+
+    "skv.preset_item_remove":
+        "Remove this shape key from the preset without deleting the shape key",
+
+    "skv.preset_object_remove":
+        "Remove all entries for this object from the preset; keep its shape keys",
+
+    "skv.preset_object_select":
+        "Select this mesh and make it the active object",
+
+    "skv.preset_object_transfer":
+        "Transfer this object's shape keys from the selected preset to another mesh",
+
+    "skv.preset_toggle_visibility":
+        "Enable or disable all shape keys belonging to this preset",
+
+    "skv.preset_toggle_auto_keyframe":
+        "Enable or disable Auto Keyframe for all shape keys in this preset",
+
+    "skv.add_selected_to_preset":
+        "Add the selected shape keys to the chosen preset",
+
+    "skv.global_preset_add_empty":
+        "Create an empty preset",
+
+    "skv.global_preset_remove":
+        "Remove this preset without deleting its shape keys",
+
+    "skv.global_preset_rename":
+        "Rename the selected preset",
+
+    "skv.global_preset_add_from_selected":
+        "Create a preset from the selected shape keys and their current values",
+}
+
+
+_SKV_SELECTION_SCOPES = {
+    "skv.select_visible": "the current group",
+    "skv.favorites_select_visible": "Favorites",
+    "skv.keyframed_select_visible": "Keyframed Shape Keys",
+    "skv.quick_select_visible": "this list",
+}
+
+
+def _skv_operator_description(cls, context, properties):
+    operator_id = cls.bl_idname
+    scope = _SKV_SELECTION_SCOPES.get(operator_id)
+
+    if scope is not None:
+        mode = getattr(properties, "mode", "")
+
+        return {
+            "ALL": (
+                f"Select all shape keys matching the search in {scope}"
+            ),
+            "CLEAR": (
+                f"Deselect shape keys matching the search in {scope}"
+            ),
+            "INVERT": (
+                f"Invert selection for shape keys matching the search in {scope}"
+            ),
+        }.get(mode, cls.bl_description)
+
+    if operator_id == "skv.group_move":
+        direction = getattr(properties, "direction", "")
+
+        return {
+            "UP": "Move the selected group one position up",
+            "DOWN": "Move the selected group one position down",
+        }.get(direction, cls.bl_description)
+
+    if operator_id == "skv.favorite_toggle":
+        scene = getattr(context, "scene", None)
+        props = getattr(scene, "skv_props", None) if scene else None
+        obj = getattr(props, "object_pick", None) if props else None
+        data = get_shape_key_data(obj)
+        name = getattr(properties, "key_name", "")
+
+        if not data or not name:
+            return cls.bl_description
+
+        if name in kd_favorite_names(data):
+            return "Remove this shape key from Favorites after confirmation"
+
+        return "Add this shape key to Favorites"
+
+    return cls.bl_description
+
 def register():
+    _register_custom_icons()
     for cls in _ALL_CLASSES:
+        if issubclass(cls, Operator):
+            operator_id = cls.bl_idname
+
+            cls.bl_description = _SKV_OPERATOR_DESCRIPTIONS.get(
+                operator_id,
+                getattr(cls, "bl_description", "")
+                or getattr(cls, "bl_label", operator_id),
+            )
+
+            if (
+                    operator_id in _SKV_SELECTION_SCOPES
+                    or operator_id in {
+                "skv.group_move",
+                "skv.favorite_toggle",
+            }
+            ):
+                cls.description = classmethod(
+                    _skv_operator_description
+                )
+
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.skv_props = PointerProperty(type=SKV_Props)
@@ -1884,6 +2047,8 @@ def unregister():
 
     for cls in reversed(_ALL_CLASSES):
         bpy.utils.unregister_class(cls)
+
+    _unregister_custom_icons()
 
 
 if __name__ == "__main__":

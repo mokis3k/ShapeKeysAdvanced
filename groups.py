@@ -762,16 +762,15 @@ class SKV_UL_key_blocks(UIList):
         opv = row.operator("skv.shape_key_toggle_visibility", text="", icon=vis_icon, emboss=False)
         opv.key_name = kb.name
 
-        if source != "KEYFRAMED":
-            favorite = kb.name in kd_favorite_names(key_data)
+        favorite = kb.name in kd_favorite_names(key_data)
 
-            opf = row.operator(
-                "skv.favorite_toggle",
-                text="",
-                icon="SOLO_ON" if favorite else "SOLO_OFF",
-                emboss=False,
-            )
-            opf.key_name = kb.name
+        opf = row.operator(
+            "skv.favorite_toggle",
+            text="",
+            icon="SOLO_ON" if favorite else "SOLO_OFF",
+            emboss=False,
+        )
+        opf.key_name = kb.name
 
         entry = _autokf_get_entry(key_data, kb.name, create=False)
         kf_enabled = bool(entry.enabled) if entry else False
@@ -1196,16 +1195,26 @@ class SKV_OT_DeleteSelectedShapeKeys(Operator):
             return {"CANCELLED"}
 
         group_name = get_selected_group_name(key_data)
+        source = key_data.skv_selection_source
         selected = kd_selected_set(key_data)
+
+        if source == "FAVORITES":
+            selected &= kd_favorite_names(key_data)
+
         basis_name = key_data.key_blocks[0].name
+
         names = [
-            kb.name for kb in key_data.key_blocks
+            kb.name
+            for kb in key_data.key_blocks
             if kb.name != basis_name
-            and kb.name in selected
-            and kd_get_group(key_data, kb.name) == group_name
+               and kb.name in selected
+               and (
+                       source != "GROUP"
+                       or kd_get_group(key_data, kb.name) == group_name
+               )
         ]
         if not names:
-            self.report({"INFO"}, "No selected shape keys in the current group.")
+            self.report({"INFO"}, "No selected shape keys in this list.")
             return {"CANCELLED"}
 
         if context.mode != "OBJECT":
@@ -1236,6 +1245,9 @@ class SKV_OT_DeleteSelectedShapeKeys(Operator):
             "skv_key_groups",
             "skv_selected",
             "skv_auto_keyframes",
+            "skv_favorites",
+            "skv_key_defaults",
+            "skv_active_keys",
         ):
             collection = getattr(key_data, attr, None)
             if collection is None:
